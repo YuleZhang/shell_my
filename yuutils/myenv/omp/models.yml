@@ -1,0 +1,19 @@
+providers:
+  stepcode-promo:
+    baseUrl: https://stepcode.basemind.com
+    api: anthropic-messages
+    disableStrictTools: true
+    apiKey: "!jq -r .apiKey /home/zhangyu/.stepcode/config.json"
+    headers:
+      x-source-user: jiigan.com
+      X-Origin-Agent: stepcode
+      X-Stepcode-Version: stepcode/v1.2.57
+    models:
+      - id: claude-opus-5
+        name: Claude Opus 5（推广模式）
+        reasoning: false
+        compat:
+          supportsEagerToolInputStreaming: false
+        input: [text, image]
+        contextWindow: 1000000
+        maxTokens: 128000

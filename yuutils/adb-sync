@@ -1,0 +1,1875 @@
+#!/usr/bin/env python3
+
+# Copyright 2014 Google Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Sync files from/to an Android device."""
+
+from __future__ import unicode_literals
+
+import argparse
+import hashlib
+import locale
+import logging
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from types import TracebackType
+from typing import Callable, cast, Dict, List, IO, Iterable, Optional, Set, Tuple, Type
+
+ADB_SYNC_VERSION = '1.0.0'
+
+
+class ChecksumUnavailable(OSError):
+  """The device could not produce checksums (e.g. it has no md5sum)."""
+
+
+class OSLike(object):
+
+  def listdir(self, path: bytes) -> Iterable[bytes]:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+  def lstat(self, path: bytes) -> os.stat_result:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+  def stat(self, path: bytes) -> os.stat_result:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+  def unlink(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+  def rmdir(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+  def makedirs(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+  def utime(self, path: bytes, times: Tuple[float, float]) -> None:  # os's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+class GlobLike(object):
+
+  def glob(self, path: bytes) -> Iterable[bytes]:  # glob's name, so pylint: disable=g-bad-name
+    raise NotImplementedError('Abstract')
+
+
+class Stdout(object):
+
+  def __init__(self, args: List[bytes], stderr: Optional[int] = None) -> None:
+    """Closes the process's stdout when done.
+
+    Usage:
+      with Stdout(...) as stdout:
+        DoSomething(stdout)
+
+    Args:
+      args: Which program to run.
+      stderr: What to do with the process's stderr; None inherits ours.
+
+    Returns:
+      An object for use by 'with'.
+    """
+    self.popen = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=stderr)
+
+  def __enter__(self) -> IO[bytes]:
+    if self.popen.stdout is None:
+      raise OSError('Subprocess stdout was not captured.')
+    return self.popen.stdout
+
+  def __exit__(self, exc_type: Optional[Type[BaseException]],
+               exc_val: Optional[Exception],
+               exc_tb: Optional[TracebackType]) -> None:
+    if self.popen.stdout is None:
+      raise OSError('Subprocess stdout was not captured.')
+    self.popen.stdout.close()
+    if self.popen.wait() != 0:
+      raise OSError('Subprocess exited with nonzero status.')
+
+
+# Substrings adb prints to stderr when a tcp/remote device drops its
+# connection. These are transient: a fresh 'adb connect host:port' brings the
+# device back, so we reconnect and retry instead of aborting the whole sync.
+ADB_TRANSPORT_ERROR_MARKERS = (
+    b'error: closed',
+    b'device offline',
+    b'not found',
+    b'no devices/emulators found',
+    b'no devices found',
+    b'protocol fault',
+    b"couldn't read",
+    b'failed to read',
+    b'eof',
+    b'connection reset',
+    b'broken pipe',
+    b'failed to connect',
+    b'cannot connect',
+    b'device still authorizing',
+    b'device still connecting',
+)
+ADB_RECONNECT_MAX_RETRIES = 8
+ADB_RECONNECT_BACKOFF_SEC = 0.5
+# 'adb connect' is itself flaky on these devices ('connect failed: closed'),
+# so the reconnect retries the connect until the device confirms it is back.
+ADB_CONNECT_MAX_RETRIES = 4
+# When a normal push keeps failing on a tcp device whose connection window is
+# shorter than the transfer (a big file always straddles a drop), retry it in
+# chunks small enough to land between drops, then reassemble and checksum-verify
+# on the device so a truncated chunk can never masquerade as a good push.
+ADB_CHUNKED_PUSH_THRESHOLD = 8 * 1024 * 1024
+ADB_CHUNKED_PUSH_BYTES = 2 * 1024 * 1024
+ADB_CHUNK_SUFFIX = b'.adbsync-part'
+
+
+class AdbFileSystem(GlobLike, OSLike):
+  """Mimics os's file interface but uses the adb utility."""
+
+  def __init__(self, adb: List[bytes],
+               push_args: Optional[List[bytes]] = None,
+               stderr: Optional[int] = None) -> None:
+    self.stat_cache = {}  # type: Dict[bytes, os.stat_result]
+    self.adb = adb
+    # Extra options for the underlying 'adb push', e.g. compression flags passed
+    # through from an adb-compatible invocation.
+    self.push_args = push_args if push_args else []
+    # What to do with the device's stderr while listing and stat'ing. Callers
+    # that stat paths which may legitimately be absent pass DEVNULL, because
+    # 'ls' complains about those and the real adb push says nothing.
+    self.stderr = stderr
+
+  def _AdbServerCommand(self) -> List[bytes]:
+    """self.adb with any '-s SERIAL' removed, for use with 'adb connect'."""
+    base = []  # type: List[bytes]
+    skip = False
+    for token in self.adb:
+      if skip:
+        skip = False
+        continue
+      if token == b'-s':
+        skip = True
+        continue
+      base.append(token)
+    return base
+
+  def _TcpSerial(self) -> Optional[bytes]:
+    """The 'host:port' serial adb targets, from '-s' or ANDROID_SERIAL."""
+    for index, token in enumerate(self.adb):
+      if token == b'-s' and index + 1 < len(self.adb):
+        serial = self.adb[index + 1]
+        return serial if b':' in serial else None
+    env_serial = os.environb.get(b'ANDROID_SERIAL', b'')
+    return env_serial if b':' in env_serial else None
+
+  def _Reconnect(self) -> bool:
+    """Restore a dropped tcp adb connection; returns whether it was attempted."""
+    serial = self._TcpSerial()
+    if not serial:
+      return False
+    connect_command = self._AdbServerCommand() + [b'connect', serial]
+    printable_serial = serial.decode('utf-8', 'replace')
+    for attempt in range(ADB_CONNECT_MAX_RETRIES):
+      logging.info('adb connection to %r dropped; reconnecting (%d/%d).',
+                   printable_serial, attempt + 1, ADB_CONNECT_MAX_RETRIES)
+      completed = subprocess.run(
+          connect_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+      output = (completed.stdout or b'').lower()
+      if completed.returncode == 0 and (
+          b'connected to' in output or b'already connected' in output):
+        return True
+      time.sleep(ADB_RECONNECT_BACKOFF_SEC)
+    # Give up confirming, but still report that a reconnect was attempted so the
+    # caller retries the command; the command itself will re-detect any failure.
+    return True
+
+  @staticmethod
+  def _LooksLikeTransportError(stderr_output: bytes) -> bool:
+    lowered = stderr_output.lower()
+    return any(marker in lowered for marker in ADB_TRANSPORT_ERROR_MARKERS)
+
+  def _RunAdb(self, args: List[bytes],
+              capture_stdout: bool) -> Tuple[int, Optional[bytes]]:
+    """Run 'adb <args>', reconnecting and retrying on transient drops.
+
+    Some remote/tcp devices close their adb connection every few commands and
+    only need a fresh 'adb connect host:port' to come back. We detect those
+    transport errors on stderr, reconnect, and retry so one dropped round trip
+    does not kill a whole sync.
+
+    stdout is captured only when capture_stdout is set; stderr is always
+    captured so it can be inspected, then forwarded to our stderr on the final
+    attempt unless the caller suppressed it with stderr=DEVNULL.
+    """
+    attempt = 0
+    while True:
+      completed = subprocess.run(
+          self.adb + args,
+          stdout=subprocess.PIPE if capture_stdout else None,
+          stderr=subprocess.PIPE)
+      stderr_output = completed.stderr or b''
+      if (completed.returncode != 0 and attempt < ADB_RECONNECT_MAX_RETRIES and
+          self._LooksLikeTransportError(stderr_output) and self._Reconnect()):
+        attempt += 1
+        time.sleep(ADB_RECONNECT_BACKOFF_SEC)
+        continue
+      if stderr_output and self.stderr != subprocess.DEVNULL:
+        sys.stderr.buffer.write(stderr_output)
+        sys.stderr.buffer.flush()
+      return completed.returncode, (
+          completed.stdout if capture_stdout else None)
+
+  def _RunAdbShellLines(self, command: bytes,
+                        allow_failure: bool = False) -> List[bytes]:
+    """Run one device shell command and return its stdout split into lines."""
+    returncode, output = self._RunAdb([b'shell', command], capture_stdout=True)
+    if returncode != 0 and not allow_failure:
+      raise OSError('Subprocess exited with nonzero status.')
+    return (output or b'').splitlines()
+
+  def _RunAdbShellCall(self, command: bytes) -> int:
+    """Run one device shell command for effect and return its exit status."""
+    returncode, _ = self._RunAdb([b'shell', command], capture_stdout=False)
+    return returncode
+
+  # Regarding parsing stat results, we only care for the following fields:
+  # - st_size
+  # - st_mtime
+  # - st_mode (but only about S_ISDIR and S_ISREG properties)
+  # Therefore, we only capture parts of 'ls -l' output that we actually use.
+  # The other fields will be filled with dummy values.
+  LS_TO_STAT_RE = re.compile(
+      br"""^
+                             (?:
+                               (?P<S_IFREG> -) |
+                               (?P<S_IFBLK> b) |
+                               (?P<S_IFCHR> c) |
+                               (?P<S_IFDIR> d) |
+                               (?P<S_IFLNK> l) |
+                               (?P<S_IFIFO> p) |
+                               (?P<S_IFSOCK> s))
+                             [-r][-w][-xsS]
+                             [-r][-w][-xsS]
+                             [-r][-w][-xtT]  # Mode string.
+                             [ ]+
+                             (?:
+                                [0-9]+  # number of hard links
+                                [ ]+
+                                )?
+                             [^ ]+  # User name/ID.
+                             [ ]+
+                             [^ ]+  # Group name/ID.
+                             [ ]+
+                             (?(S_IFBLK) [^ ]+[ ]+[^ ]+[ ]+)  # Device numbers.
+                             (?(S_IFCHR) [^ ]+[ ]+[^ ]+[ ]+)  # Device numbers.
+                             (?(S_IFDIR) [0-9]+ [ ]+)?        # directory Size.
+                             (?(S_IFREG)
+                               (?P<st_size> [0-9]+)           # Size.
+                               [ ]+)
+                             (?P<st_mtime>
+                               [0-9]{4}-[0-9]{2}-[0-9]{2}     # Date.
+                               [ ]
+                               [0-9]{2}:[0-9]{2})             # Time.
+                             [ ]
+                             # Don't capture filename for symlinks (ambiguous).
+                             (?(S_IFLNK) .* | (?P<filename> .*))
+                             $""", re.DOTALL | re.VERBOSE)
+
+  def LsToStat(self, line: bytes) -> Tuple[os.stat_result, bytes]:
+    """Convert a line from 'ls -l' output to a stat result.
+
+    Args:
+      line: Output line of 'ls -l' on Android.
+
+    Returns:
+      os.stat_result for the line.
+
+    Raises:
+      OSError: if the given string is not a 'ls -l' output line (but maybe an
+      error message instead).
+    """
+
+    match = self.LS_TO_STAT_RE.match(line)
+    if match is None:
+      logging.error('Could not parse %r.', line)
+      raise OSError('Unparseable ls -al result.')
+    groups = match.groupdict()
+
+    # Get the values we're interested in.
+    st_mode = (  # 0755
+        stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH
+        | stat.S_IXOTH)
+    if groups['S_IFREG']:
+      st_mode |= stat.S_IFREG
+    if groups['S_IFBLK']:
+      st_mode |= stat.S_IFBLK
+    if groups['S_IFCHR']:
+      st_mode |= stat.S_IFCHR
+    if groups['S_IFDIR']:
+      st_mode |= stat.S_IFDIR
+    if groups['S_IFIFO']:
+      st_mode |= stat.S_IFIFO
+    if groups['S_IFLNK']:
+      st_mode |= stat.S_IFLNK
+    if groups['S_IFSOCK']:
+      st_mode |= stat.S_IFSOCK
+    st_size = None if groups['st_size'] is None else int(groups['st_size'])
+    st_mtime = int(
+        time.mktime(
+            time.strptime(
+                match.group('st_mtime').decode('ascii'), '%Y-%m-%d %H:%M')))
+
+    # Fill the rest with dummy values.
+    st_ino = 1
+    st_rdev = 0
+    st_nlink = 1
+    st_uid = -2  # Nobody.
+    st_gid = -2  # Nobody.
+    st_atime = st_ctime = st_mtime
+
+    stbuf = os.stat_result((st_mode, st_ino, st_rdev, st_nlink, st_uid, st_gid,
+                            st_size, st_atime, st_mtime, st_ctime))
+    filename = groups['filename']
+    return stbuf, filename
+
+  def QuoteArgument(self, arg: bytes) -> bytes:
+    # Quotes an argument for use by adb shell.
+    # Usually, arguments in 'adb shell' use are put in double quotes by adb,
+    # but not in any way escaped.
+    arg = arg.replace(b'\\', b'\\\\')
+    arg = arg.replace(b'"', b'\\"')
+    arg = arg.replace(b'$', b'\\$')
+    arg = arg.replace(b'`', b'\\`')
+    arg = b'"' + arg + b'"'
+    return arg
+
+  def IsWorking(self) -> bool:
+    """Tests the adb connection."""
+    # This string should contain all possible evil, but no percent signs.
+    # Note this code uses 'date' and not 'echo', as date just calls strftime
+    # while echo does its own backslash escape handling additionally to the
+    # shell's. Too bad printf "%s\n" is not available.
+    test_strings = [
+        b'(', b'(;  #`ls`$PATH\'"(\\\\\\\\){};!\xc0\xaf\xff\xc2\xbf'
+    ]
+    for test_string in test_strings:
+      command = b'date +%s' % (self.QuoteArgument(test_string),)
+      returncode, output = self._RunAdb(
+          [b'shell', command], capture_stdout=True)
+      if returncode != 0:
+        return False
+      if not any(line == test_string for line in (output or b'').splitlines()):
+        return False
+    return True
+
+  def listdir(self, path: bytes) -> Iterable[bytes]:  # os's name, so pylint: disable=g-bad-name
+    """List the contents of a directory, caching them for later lstat calls."""
+    for line in self._RunAdbShellLines(
+        b'ls -al %s' % (self.QuoteArgument(path + b'/'),)):
+      if line.startswith(b'total '):
+        continue
+      try:
+        statdata, filename = self.LsToStat(line)
+      except OSError:
+        continue
+      if filename is None:
+        logging.error('Could not parse %r.', line)
+      else:
+        self.stat_cache[path + b'/' + filename] = statdata
+        yield filename
+
+  def lstat(self, path: bytes) -> os.stat_result:  # os's name, so pylint: disable=g-bad-name
+    """Stat a file."""
+    if path in self.stat_cache:
+      return self.stat_cache[path]
+    for line in self._RunAdbShellLines(
+        b'ls -ald %s' % (self.QuoteArgument(path),), allow_failure=True):
+      if line.startswith(b'total '):
+        continue
+      statdata, _ = self.LsToStat(line)
+      self.stat_cache[path] = statdata
+      return statdata
+    raise OSError('No such file or directory')
+
+  def stat(self, path: bytes) -> os.stat_result:  # os's name, so pylint: disable=g-bad-name
+    """Stat a file."""
+    if path in self.stat_cache and not stat.S_ISLNK(
+        self.stat_cache[path].st_mode):
+      return self.stat_cache[path]
+    for line in self._RunAdbShellLines(
+        b'ls -aldL %s' % (self.QuoteArgument(path),), allow_failure=True):
+      if line.startswith(b'total '):
+        continue
+      statdata, _ = self.LsToStat(line)
+      self.stat_cache[path] = statdata
+      return statdata
+    raise OSError('No such file or directory')
+
+  def unlink(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
+    """Delete a file."""
+    if self._RunAdbShellCall(b'rm %s' % (self.QuoteArgument(path),)) != 0:
+      raise OSError('unlink failed')
+
+  def rmdir(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
+    """Delete a directory."""
+    if self._RunAdbShellCall(b'rmdir %s' % (self.QuoteArgument(path),)) != 0:
+      raise OSError('rmdir failed')
+
+  def Checksums(self, paths: List[bytes]) -> Dict[bytes, bytes]:
+    """Calculate checksums on the device, batching paths per adb invocation."""
+    checksums = {}  # type: Dict[bytes, bytes]
+    batches = []  # type: List[List[bytes]]
+    batch = []  # type: List[bytes]
+    command_size = 0
+    for path in paths:
+      quoted_path = self.QuoteArgument(path)
+      # Keep below typical shell command length limits and avoid an adb round
+      # trip for every file.
+      if batch and (len(batch) >= 128 or
+                    command_size + len(quoted_path) + 1 > 24576):
+        batches.append(batch)
+        batch = []
+        command_size = 0
+      batch.append(path)
+      command_size += len(quoted_path) + 1
+    if batch:
+      batches.append(batch)
+
+    for batch in batches:
+      command = (
+          b'for p in ' +
+          b' '.join(self.QuoteArgument(path) for path in batch) +
+          b'; do checksum=$(md5sum < "$p") || exit $?; '
+          b'echo "${checksum%% *}"; done')
+      returncode, output = self._RunAdb([b'shell', command], capture_stdout=True)
+      if returncode != 0:
+        raise ChecksumUnavailable(
+            'Could not calculate checksums on the device. '
+            'Ensure that md5sum is installed and the files are readable.')
+      lines = (output or b'').splitlines()
+      if len(lines) != len(batch):
+        raise ChecksumUnavailable(
+            'Unexpected md5sum output from the device: expected %d lines, '
+            'got %d.' % (len(batch), len(lines)))
+      for path, line in zip(batch, lines):
+        fields = line.split()
+        checksum = fields[0].lower() if fields else b''
+        if not re.fullmatch(br'[0-9a-f]{32}', checksum):
+          raise ChecksumUnavailable('Invalid checksum returned for %r: %r' %
+                                    (path, line))
+        checksums[path] = checksum
+    return checksums
+
+  def makedirs(self, path: bytes) -> None:  # os's name, so pylint: disable=g-bad-name
+    """Create a directory."""
+    if self._RunAdbShellCall(b'mkdir -p %s' % (self.QuoteArgument(path),)) != 0:
+      raise OSError('mkdir failed')
+
+  def utime(self, path: bytes, times: Tuple[float, float]) -> None:
+    # TODO(rpolzer): Find out why this does not work (returns status 255).
+    """Set the time of a file to a specified unix time."""
+    atime, mtime = times
+    timestr = time.strftime('%Y%m%d.%H%M%S',
+                            time.localtime(mtime)).encode('ascii')
+    if self._RunAdbShellCall(
+        b'touch -mt %s %s' % (timestr, self.QuoteArgument(path))) != 0:
+      raise OSError('touch failed')
+    timestr = time.strftime('%Y%m%d.%H%M%S',
+                            time.localtime(atime)).encode('ascii')
+    if self._RunAdbShellCall(
+        b'touch -at %s %s' % (timestr, self.QuoteArgument(path))) != 0:
+      raise OSError('touch failed')
+
+  def glob(self, path: bytes) -> Iterable[bytes]:  # glob's name, so pylint: disable=g-bad-name
+    for line in self._RunAdbShellLines(
+        b'for p in %s; do echo "$p"; done' % (path,)):
+      yield line
+
+  def Push(self, src: bytes, dst: bytes) -> None:
+    """Push a file from the local file system to the Android device."""
+    returncode, _ = self._RunAdb(
+        [b'push'] + self.push_args + [src, dst], capture_stdout=False)
+    if returncode == 0:
+      return
+    # Flaky tcp devices frequently transfer the whole file and only then drop
+    # the connection, so adb reports failure for a push that actually landed.
+    # Reconnecting and re-pushing a multi-second transfer hits the same drop
+    # every time, so accept the push when the on-device size already matches.
+    if self._PushLanded(src, dst):
+      logging.info(
+          'push of %r reported failure but the file landed intact; accepting.',
+          dst)
+      return
+    # A big file transfer takes longer than such a device stays connected, so
+    # every whole-file push straddles a drop. Retry it in small chunks that fit
+    # between drops, then reassemble and checksum-verify on the device.
+    if (self._TcpSerial() and
+        self._FileSize(src) > ADB_CHUNKED_PUSH_THRESHOLD):
+      logging.info('push of %r kept failing; retrying as a chunked transfer.',
+                   dst)
+      self._PushChunked(src, dst)
+      return
+    raise OSError('push failed')
+
+  def _FileSize(self, path: bytes) -> int:
+    try:
+      return os.lstat(path).st_size
+    except OSError:
+      return 0
+
+  def _PushLanded(self, src: bytes, dst: bytes) -> bool:
+    """Whether dst on the device already matches src's size after a failed push."""
+    try:
+      expected_size = os.lstat(src).st_size
+    except OSError:
+      return False
+    # adb push writes to dst directly, or into dst/<basename> when dst is a dir.
+    candidates = [dst, dst.rstrip(b'/') + b'/' + os.path.basename(src.rstrip(b'/'))]
+    for candidate in candidates:
+      self.stat_cache.pop(candidate, None)
+      try:
+        landed = self.lstat(candidate)
+      except OSError:
+        continue
+      if stat.S_ISREG(landed.st_mode) and landed.st_size == expected_size:
+        return True
+    return False
+
+  def _PushChunked(self, src: bytes, dst: bytes) -> None:
+    """Push src in small chunks, reassemble on the device, and verify md5."""
+    quoted_dst = self.QuoteArgument(dst)
+    # Quote the path but leave the trailing wildcard unquoted so the device
+    # shell expands it; this clears parts left behind by an earlier failed run.
+    stale_parts_glob = self.QuoteArgument(dst + ADB_CHUNK_SUFFIX) + b'.*'
+    self._RunAdbShellCall(b'rm -f %s %s' % (quoted_dst, stale_parts_glob))
+
+    parts = []  # type: List[bytes]
+    with tempfile.TemporaryDirectory() as scratch:
+      scratch_dir = os.fsencode(scratch)
+      with open(src, 'rb') as source:
+        index = 0
+        while True:
+          data = source.read(ADB_CHUNKED_PUSH_BYTES)
+          if not data:
+            break
+          local_part = os.path.join(scratch_dir, b'part.%05d' % index)
+          with open(local_part, 'wb') as chunk_file:
+            chunk_file.write(data)
+          remote_part = dst + ADB_CHUNK_SUFFIX + b'.%05d' % index
+          returncode, _ = self._RunAdb(
+              [b'push'] + self.push_args + [local_part, remote_part],
+              capture_stdout=False)
+          if returncode != 0 and not self._PushLanded(local_part, remote_part):
+            self._RunAdbShellCall(b'rm -f %s' % stale_parts_glob)
+            raise OSError('push failed')
+          parts.append(remote_part)
+          index += 1
+
+    if not parts:
+      if self._RunAdbShellCall(b': > %s' % quoted_dst) != 0:
+        raise OSError('push failed')
+      return
+
+    quoted_parts = b' '.join(self.QuoteArgument(part) for part in parts)
+    cat_status = self._RunAdbShellCall(b'cat %s > %s' % (quoted_parts, quoted_dst))
+    self._RunAdbShellCall(b'rm -f %s' % quoted_parts)
+    if cat_status != 0:
+      raise OSError('push failed')
+
+    # A truncated chunk or a bad reassembly must never look like success.
+    try:
+      expected = FileChecksum(src)
+      actual = self.Checksums([dst]).get(dst)
+    except ChecksumUnavailable:
+      if self._PushLanded(src, dst):
+        return
+      raise OSError('push failed')
+    if actual != expected:
+      raise OSError('push failed')
+
+  def Pull(self, src: bytes, dst: bytes) -> None:
+    """Pull a file from the Android device to the local file system."""
+    returncode, _ = self._RunAdb([b'pull', src, dst], capture_stdout=False)
+    if returncode != 0:
+      raise OSError('pull failed')
+
+
+def FileChecksum(path: bytes) -> bytes:
+  """Calculate a local file checksum without invoking a shell."""
+  digest = hashlib.md5()  # nosec: Used for change detection, not security.
+  with open(path, 'rb') as input_file:
+    while True:
+      data = input_file.read(1024 * 1024)
+      if not data:
+        break
+      digest.update(data)
+  return digest.hexdigest().encode('ascii')
+
+
+def BuildFileList(fs: OSLike, path: bytes, follow_links: bool,
+                  prefix: bytes) -> Iterable[Tuple[bytes, os.stat_result]]:
+  """Builds a file list.
+
+  Args:
+    fs: File system provider (can be os or AdbFileSystem()).
+    path: Initial path.
+    follow_links: Whether to follow symlinks while iterating. May recurse
+      endlessly.
+    prefix: Path prefix for output file names.
+
+  Yields:
+    File names from path (prefixed by prefix).
+    Directories are yielded before their contents.
+  """
+  try:
+    if follow_links:
+      statresult = fs.stat(path)
+    else:
+      statresult = fs.lstat(path)
+  except OSError:
+    return
+  if stat.S_ISDIR(statresult.st_mode):
+    yield prefix, statresult
+    try:
+      files = fs.listdir(path)
+    except OSError:
+      return
+    for n in files:
+      if n == b'.' or n == b'..':
+        continue
+      for t in BuildFileList(fs, path + b'/' + n, follow_links,
+                             prefix + b'/' + n):
+        yield t
+  elif stat.S_ISREG(statresult.st_mode):
+    yield prefix, statresult
+  elif stat.S_ISLNK(statresult.st_mode) and not follow_links:
+    yield prefix, statresult
+  else:
+    logging.info('Unsupported file: %r.', path)
+
+
+def DiffLists(a: Iterable[Tuple[bytes, os.stat_result]],
+              b: Iterable[Tuple[bytes, os.stat_result]]
+             ) -> Tuple[List[Tuple[bytes, os.stat_result]], List[
+                 Tuple[bytes, os.stat_result, os
+                       .stat_result]], List[Tuple[bytes, os.stat_result]]]:
+  """Compares two lists.
+
+  Args:
+    a: the first list.
+    b: the second list.
+
+  Returns:
+    a_only: the items from list a.
+    both: the items from both list, with the remaining tuple items combined.
+    b_only: the items from list b.
+  """
+  a_only = []  # type: List[Tuple[bytes, os.stat_result]]
+  b_only = []  # type: List[Tuple[bytes, os.stat_result]]
+  both = []  # type: List[Tuple[bytes, os.stat_result, os.stat_result]]
+
+  a_revlist = sorted(a)
+  a_revlist.reverse()
+  b_revlist = sorted(b)
+  b_revlist.reverse()
+
+  while True:
+    if not a_revlist:
+      b_only.extend(reversed(b_revlist))
+      break
+    if not b_revlist:
+      a_only.extend(reversed(a_revlist))
+      break
+    a_item = a_revlist[len(a_revlist) - 1]
+    b_item = b_revlist[len(b_revlist) - 1]
+    if a_item[0] == b_item[0]:
+      both.append((a_item[0], a_item[1], b_item[1]))
+      a_revlist.pop()
+      b_revlist.pop()
+    elif a_item[0] < b_item[0]:
+      a_only.append(a_item)
+      a_revlist.pop()
+    elif a_item[0] > b_item[0]:
+      b_only.append(b_item)
+      b_revlist.pop()
+    else:
+      raise
+
+  return a_only, both, b_only
+
+
+class DeleteInterruptedFile(object):
+
+  def __init__(self, dry_run: bool, fs: OSLike, name: bytes) -> None:
+    """Sets up interrupt protection.
+
+    Usage:
+      with DeleteInterruptedFile(False, fs, name):
+        DoSomething()
+
+      If DoSomething() should get interrupted, the file 'name' will be deleted.
+      The exception otherwise will be passed on.
+
+    Args:
+      dry_run: If true, we don't actually delete.
+      fs: File system object.
+      name: File name to delete.
+
+    Returns:
+      An object for use by 'with'.
+    """
+    self.dry_run = dry_run
+    self.fs = fs
+    self.name = name
+
+  def __enter__(self) -> None:
+    pass
+
+  def __exit__(self, exc_type: Optional[Type[BaseException]],
+               exc_val: Optional[Exception],
+               exc_tb: Optional[TracebackType]) -> None:
+    if exc_type is not None:
+      logging.info('Interrupted-%s-Delete: %r',
+                   'Pull' if self.fs == os else 'Push', self.name)
+      if not self.dry_run:
+        self.fs.unlink(self.name)
+
+
+class FileSyncer(object):
+  """File synchronizer."""
+
+  def __init__(self, adb: AdbFileSystem, local_path: bytes, remote_path: bytes,
+               local_to_remote: bool, remote_to_local: bool,
+               preserve_times: bool, delete_missing: bool,
+               allow_overwrite: bool, allow_replace: bool, copy_links: bool,
+               dry_run: bool, checksum: bool = False) -> None:
+    self.local = local_path
+    self.remote = remote_path
+    self.adb = adb
+    self.local_to_remote = local_to_remote
+    self.remote_to_local = remote_to_local
+    self.preserve_times = preserve_times
+    self.delete_missing = delete_missing
+    self.allow_overwrite = allow_overwrite
+    self.allow_replace = allow_replace
+    self.copy_links = copy_links
+    self.dry_run = dry_run
+    self.checksum = checksum
+    self.checksum_different = set()  # type: Set[bytes]
+    self.num_bytes = 0
+    self.start_time = time.time()
+
+  # Attributes filled in later.
+  local_only = None  # type: List[Tuple[bytes, os.stat_result]]
+  both = None  # type: List[Tuple[bytes, os.stat_result, os.stat_result]]
+  remote_only = None  # type: List[Tuple[bytes, os.stat_result]]
+  src_to_dst = None  # type: Tuple[bool, bool]
+  dst_to_src = None  # type: Tuple[bool, bool]
+  src_only = None  # type: Tuple[List[Tuple[bytes, os.stat_result]], List[Tuple[bytes, os.stat_result]]]
+  dst_only = None  # type: Tuple[List[Tuple[bytes, os.stat_result]], List[Tuple[bytes, os.stat_result]]]
+  src = None  # type: Tuple[bytes, bytes]
+  dst = None  # type: Tuple[bytes, bytes]
+  dst_fs = None  # type: Tuple[OSLike, OSLike]
+  push = None  # type: Tuple[str, str]
+  copy = None  # type: Tuple[Callable[[bytes, bytes], None], Callable[[bytes, bytes], None]]
+
+  def IsWorking(self) -> bool:
+    """Tests the adb connection."""
+    return self.adb.IsWorking()
+
+  def ScanAndDiff(self) -> None:
+    """Scans the local and remote locations and identifies differences."""
+    logging.info('Scanning and diffing...')
+    locallist = BuildFileList(
+        cast(OSLike, os), self.local, self.copy_links, b'')
+    remotelist = BuildFileList(
+        self.adb, self.remote, self.copy_links, b'')
+
+    self.local_only, self.both, self.remote_only = DiffLists(
+        locallist, remotelist)
+    if self.checksum:
+      candidates = [
+          name for name, localstat, remotestat in self.both
+          if stat.S_ISREG(localstat.st_mode)
+          and stat.S_ISREG(remotestat.st_mode)
+          and localstat.st_size == remotestat.st_size
+      ]
+      remote_paths = [self.remote + name for name in candidates]
+      remote_checksums = self.adb.Checksums(remote_paths)
+      for name, remote_path in zip(candidates, remote_paths):
+        local_checksum = FileChecksum(self.local + name)
+        if local_checksum != remote_checksums[remote_path]:
+          self.checksum_different.add(name)
+    if not self.local_only and not self.both and not self.remote_only:
+      logging.warning('No files seen. User error?')
+    self.src_to_dst = (self.local_to_remote, self.remote_to_local)
+    self.dst_to_src = (self.remote_to_local, self.local_to_remote)
+    self.src_only = (self.local_only, self.remote_only)
+    self.dst_only = (self.remote_only, self.local_only)
+    self.src = (self.local, self.remote)
+    self.dst = (self.remote, self.local)
+    self.dst_fs = (self.adb, cast(OSLike, os))
+    self.push = ('Push', 'Pull')
+    self.copy = (self.adb.Push, self.adb.Pull)
+
+  def PerformDeletions(self) -> None:
+    """Perform all deleting necessary for the file sync operation."""
+    if not self.delete_missing:
+      return
+    for i in [0, 1]:
+      if self.src_to_dst[i] and not self.dst_to_src[i]:
+        if not self.src_only[i] and not self.both:
+          logging.error('Cowardly refusing to delete everything.')
+        else:
+          for name, s in reversed(self.dst_only[i]):
+            dst_name = self.dst[i] + name
+            logging.info('%s-Delete: %r', self.push[i], dst_name)
+            if stat.S_ISDIR(s.st_mode):
+              if not self.dry_run:
+                self.dst_fs[i].rmdir(dst_name)
+            else:
+              if not self.dry_run:
+                self.dst_fs[i].unlink(dst_name)
+          del self.dst_only[i][:]
+
+  def PerformOverwrites(self) -> None:
+    """Delete files/directories that are in the way for overwriting."""
+    src_only_prepend = (
+        [], []
+    )  # type: Tuple[List[Tuple[bytes, os.stat_result]], List[Tuple[bytes, os.stat_result]]]
+    for name, localstat, remotestat in self.both:
+      if stat.S_ISDIR(localstat.st_mode) and stat.S_ISDIR(remotestat.st_mode):
+        # A dir is a dir is a dir.
+        continue
+      elif stat.S_ISDIR(localstat.st_mode) or stat.S_ISDIR(remotestat.st_mode):
+        # Dir vs file? Nothing to do here yet.
+        pass
+      else:
+        # File vs file? Compare sizes.
+        if (localstat.st_size == remotestat.st_size and
+            name not in self.checksum_different):
+          continue
+      l2r = self.local_to_remote
+      r2l = self.remote_to_local
+      if l2r and r2l:
+        # Truncate times to full minutes, as Android's "ls" only outputs minute
+        # accuracy.
+        localminute = int(localstat.st_mtime / 60)
+        remoteminute = int(remotestat.st_mtime / 60)
+        if localminute > remoteminute:
+          r2l = False
+        elif localminute < remoteminute:
+          l2r = False
+      if l2r and r2l:
+        logging.warning('Unresolvable: %r', name)
+        continue
+      if l2r:
+        i = 0  # Local to remote operation.
+        src_stat = localstat
+        dst_stat = remotestat
+      else:
+        i = 1  # Remote to local operation.
+        src_stat = remotestat
+        dst_stat = localstat
+      dst_name = self.dst[i] + name
+      logging.info('%s-Delete-Conflicting: %r', self.push[i], dst_name)
+      if stat.S_ISDIR(localstat.st_mode) or stat.S_ISDIR(remotestat.st_mode):
+        if not self.allow_replace:
+          logging.info('Would have to replace to do this. '
+                       'Use --force to allow this.')
+          continue
+      if not self.allow_overwrite:
+        logging.info('Would have to overwrite to do this, '
+                     'which --no-clobber forbids.')
+        continue
+      if stat.S_ISDIR(dst_stat.st_mode):
+        kill_files = [
+            x for x in self.dst_only[i] if x[0][:len(name) + 1] == name + b'/'
+        ]
+        self.dst_only[i][:] = [
+            x for x in self.dst_only[i] if x[0][:len(name) + 1] != name + b'/'
+        ]
+        for l, s in reversed(kill_files):
+          if stat.S_ISDIR(s.st_mode):
+            if not self.dry_run:
+              self.dst_fs[i].rmdir(self.dst[i] + l)
+          else:
+            if not self.dry_run:
+              self.dst_fs[i].unlink(self.dst[i] + l)
+        if not self.dry_run:
+          self.dst_fs[i].rmdir(dst_name)
+      elif stat.S_ISDIR(src_stat.st_mode):
+        if not self.dry_run:
+          self.dst_fs[i].unlink(dst_name)
+      else:
+        if not self.dry_run:
+          self.dst_fs[i].unlink(dst_name)
+      src_only_prepend[i].append((name, src_stat))
+    for i in [0, 1]:
+      self.src_only[i][:0] = src_only_prepend[i]
+
+  def PerformCopies(self) -> None:
+    """Perform all copying necessary for the file sync operation."""
+    for i in [0, 1]:
+      if self.src_to_dst[i]:
+        for name, s in self.src_only[i]:
+          src_name = self.src[i] + name
+          dst_name = self.dst[i] + name
+          logging.info('%s: %r', self.push[i], dst_name)
+          if stat.S_ISDIR(s.st_mode):
+            if not self.dry_run:
+              self.dst_fs[i].makedirs(dst_name)
+          else:
+            with DeleteInterruptedFile(self.dry_run, self.dst_fs[i], dst_name):
+              if not self.dry_run:
+                self.copy[i](src_name, dst_name)
+              if stat.S_ISREG(s.st_mode):
+                self.num_bytes += s.st_size
+          if not self.dry_run:
+            if self.preserve_times:
+              logging.info('%s-Times: accessed %s, modified %s', self.push[i],
+                           time.asctime(time.localtime(s.st_atime)),
+                           time.asctime(time.localtime(s.st_mtime)))
+              self.dst_fs[i].utime(dst_name, (s.st_atime, s.st_mtime))
+
+  def TimeReport(self) -> None:
+    """Report time and amount of data transferred."""
+    if self.dry_run:
+      logging.info('Total: %d bytes', self.num_bytes)
+    else:
+      end_time = time.time()
+      dt = end_time - self.start_time
+      rate = self.num_bytes / 1024.0 / dt
+      logging.info('Total: %d KB/s (%d bytes in %.3fs)', rate, self.num_bytes,
+                   dt)
+
+
+def ExpandWildcards(globber: GlobLike, path: bytes) -> Iterable[bytes]:
+  if path.find(b'?') == -1 and path.find(b'*') == -1 and path.find(b'[') == -1:
+    return [path]
+  return globber.glob(path)
+
+
+def FixPath(src: bytes, dst: bytes) -> Tuple[bytes, bytes]:
+  # rsync-like path munging to make remote specifications shorter.
+  append = b''
+  pos = src.rfind(b'/')
+  if pos >= 0:
+    if src.endswith(b'/'):
+      # Final slash: copy to the destination "as is".
+      pass
+    else:
+      # No final slash: destination name == source name.
+      append = src[pos:]
+  else:
+    # No slash at all - use same name at destination.
+    append = b'/' + src
+  # Append the destination file name if any.
+  # BUT: do not append "." or ".." components!
+  if append != b'/.' and append != b'/..':
+    dst += append
+  return (src, dst)
+
+
+# -- adb push compatibility ---------------------------------------------------
+#
+# bin/adb routes 'adb push ...' here so that existing scripts get a
+# checksum-based sync without being edited. The code below reproduces what the
+# real adb does with its arguments; the transfer itself reuses FileSyncer.
+
+ADB_GLOBAL_OPTIONS = frozenset([b'-a', b'-d', b'-e', b'--exit-on-write-error'])
+ADB_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    [b'-s', b'-t', b'-H', b'-P', b'-L', b'--one-device'])
+# Compression options are handed to the underlying 'adb push' unchanged.
+ADB_PUSH_PASSTHROUGH = frozenset([b'-Z'])
+ADB_PUSH_PASSTHROUGH_WITH_VALUE = frozenset([b'-z'])
+
+
+class UsageError(Exception):
+  """An argument list the real adb would have rejected."""
+
+
+class AdbPushCall(object):
+  """A parsed 'adb [global...] push [option...] LOCAL... REMOTE' invocation."""
+
+  def __init__(self) -> None:
+    self.global_options = []  # type: List[bytes]
+    self.push_options = []  # type: List[bytes]
+    self.sources = []  # type: List[bytes]
+    self.destination = b''
+    self.dry_run = False
+    self.quiet = False
+    self.mirror = False
+
+
+def ParseAdbPushArgv(argv: List[bytes]) -> AdbPushCall:
+  """Parse an argument list the way adb parses its own 'push' command.
+
+  Args:
+    argv: Arguments as adb received them, e.g. [b'-s', b'SERIAL', b'push',
+      b'lib.so', b'/data/local/tmp'].
+
+  Returns:
+    The parsed invocation.
+
+  Raises:
+    UsageError: if adb itself would have refused these arguments.
+  """
+  call = AdbPushCall()
+
+  index = 0
+  while index < len(argv):
+    argument = argv[index]
+    if argument in ADB_GLOBAL_OPTIONS_WITH_VALUE:
+      if index + 1 >= len(argv):
+        raise UsageError('%s requires an argument' % os.fsdecode(argument))
+      call.global_options += [argument, argv[index + 1]]
+      index += 2
+    elif argument in ADB_GLOBAL_OPTIONS:
+      call.global_options.append(argument)
+      index += 1
+    else:
+      break
+
+  if index >= len(argv) or argv[index] != b'push':
+    raise UsageError('not an adb push invocation')
+  index += 1
+
+  # adb accepts push options anywhere among the positional arguments, and
+  # existing scripts do write 'adb push SRC DST --sync'.
+  positional = []  # type: List[bytes]
+  while index < len(argv):
+    argument = argv[index]
+    if argument in ADB_PUSH_PASSTHROUGH_WITH_VALUE:
+      if index + 1 >= len(argv):
+        raise UsageError('%s requires an argument' % os.fsdecode(argument))
+      call.push_options += [argument, argv[index + 1]]
+      index += 2
+      continue
+    if argument in ADB_PUSH_PASSTHROUGH:
+      call.push_options.append(argument)
+    elif argument == b'--sync':
+      # Only pushes files whose timestamps differ. Comparing checksums is
+      # strictly more accurate, so this is accepted and dropped.
+      pass
+    elif argument == b'-n':
+      call.dry_run = True
+    elif argument == b'-q':
+      call.quiet = True
+    elif argument == b'--mirror':
+      # This is an adb-sync extension. Keep it out of call.push_options so the
+      # real adb never sees an option it does not understand.
+      call.mirror = True
+    elif argument.startswith(b'-') and argument != b'-':
+      raise UsageError("unrecognized option '%s'" % os.fsdecode(argument))
+    else:
+      positional.append(argument)
+    index += 1
+
+  if len(positional) < 2:
+    raise UsageError('push requires a source and a destination')
+  call.sources = positional[:-1]
+  call.destination = positional[-1]
+  return call
+
+
+def PushBasename(path: bytes) -> bytes:
+  """The name adb gives a pushed item: last component, trailing slashes ignored."""
+  stripped = path.rstrip(b'/')
+  position = stripped.rfind(b'/')
+  if position >= 0:
+    return stripped[position + 1:]
+  return stripped
+
+
+def ResolvePushDest(fs: OSLike, sources: List[bytes],
+                    destination: bytes) -> List[Tuple[bytes, bytes]]:
+  """Work out where 'adb push' would place each source.
+
+  The rules below were measured against adb 1.0.41 on two platforms (taro,
+  Android 12 and motorola_edge_2025, Android 17), which agreed on every case:
+
+    FILE -> existing dir              -> dir/basename(FILE)
+    FILE -> absent path               -> that path, parent dirs created
+    FILE -> existing file             -> overwritten
+    DIR  -> existing dir              -> dir/basename(DIR)
+    DIR  -> absent path               -> that path holds DIR's contents
+    DIR/ -> anything                  -> same as DIR; trailing slashes ignored
+    many -> existing dir              -> dir/basename(each)
+    many -> anything else             -> error, nothing transferred
+    DIR  -> existing file             -> error
+    any  -> absent path ending in '/' -> error
+
+  Args:
+    fs: File system provider for the device side.
+    sources: Local paths, as given on the command line.
+    destination: Remote path, as given on the command line.
+
+  Returns:
+    (source, resolved destination) for each source, in order.
+
+  Raises:
+    UsageError: in the cases marked "error" above.
+  """
+  for source in sources:
+    if not os.path.exists(source):
+      raise UsageError("cannot stat '%s': No such file or directory" %
+                       os.fsdecode(source))
+
+  stripped = destination.rstrip(b'/') or b'/'
+  try:
+    destination_stat = fs.stat(stripped)  # type: Optional[os.stat_result]
+  except OSError:
+    destination_stat = None
+  destination_is_dir = (destination_stat is not None and
+                        stat.S_ISDIR(destination_stat.st_mode))
+
+  if len(sources) > 1:
+    if not destination_is_dir:
+      raise UsageError("target '%s' is not a directory" %
+                       os.fsdecode(destination))
+    return [(source, stripped + b'/' + PushBasename(source))
+            for source in sources]
+
+  source = sources[0]
+  if destination_is_dir:
+    return [(source, stripped + b'/' + PushBasename(source))]
+  if destination.endswith(b'/'):
+    raise UsageError("failed to copy '%s' to '%s': remote couldn't create "
+                     'file: Is a directory' %
+                     (os.fsdecode(source), os.fsdecode(destination)))
+  if destination_stat is not None and os.path.isdir(source):
+    raise UsageError("target '%s' is not a directory" %
+                     os.fsdecode(destination))
+  return [(source, destination)]
+
+
+def CountFileEntries(
+    entries: Iterable[Tuple],  # (name, stat, ...) as produced by BuildFileList
+) -> int:
+  """Count entries that are not directories."""
+  return sum(1 for entry in entries if not stat.S_ISDIR(entry[1].st_mode))
+
+
+def CountDifferingFiles(syncer: 'FileSyncer') -> Tuple[int, int]:
+  """How many files would be transferred, and how many exist locally at all.
+
+  Applies the same comparison PerformOverwrites does but changes no state, so the
+  caller can still choose how to transfer before anything has been touched.
+
+  Args:
+    syncer: A FileSyncer on which ScanAndDiff has already run.
+
+  Returns:
+    (files that differ, files present locally).
+  """
+  differing = CountFileEntries(syncer.local_only)
+  local_files = differing
+  for name, local_stat, remote_stat in syncer.both:
+    if stat.S_ISDIR(local_stat.st_mode):
+      # Either both sides are directories or a directory replaces a file;
+      # neither is a file transfer.
+      continue
+    local_files += 1
+    if (not stat.S_ISDIR(remote_stat.st_mode) and
+        local_stat.st_size == remote_stat.st_size and
+        name not in syncer.checksum_different):
+      continue
+    differing += 1
+  return differing, local_files
+
+
+# Transferring file by file costs one adb process per file. Measured over TCP:
+# 60 files took 21.5s that way against 3.8s for a single 'adb push' of the whole
+# tree, so once enough of the tree differs it is faster to let adb push all of
+# it, identical files included. The result on the device is the same either way.
+BULK_PUSH_MIN_FILES = 8
+BULK_PUSH_PERCENT = 40
+
+# How many sources to hand to one 'adb push'. Real calls already reach a hundred
+# (a glob over a resource directory), and adb copes, but the command line is not
+# unbounded.
+MAX_PUSH_SOURCES = 256
+
+
+def RemoteParent(path: bytes) -> bytes:
+  """The directory part of a remote path."""
+  return path.rpartition(b'/')[0] or b'/'
+
+
+def StatCacheKey(directory: bytes, name: bytes) -> bytes:
+  """The key AdbFileSystem.listdir caches an entry under."""
+  return directory + b'/' + name
+
+
+def PlanFilePushes(
+    adb: AdbFileSystem,
+    pairs: List[Tuple[bytes, bytes]],
+    use_checksums: bool = True
+) -> Tuple[List[Tuple[bytes, bytes]], int, Set[bytes]]:
+  """Decide which (local file, remote path) pairs actually need transferring.
+
+  Costs one directory listing per destination directory plus one batched md5sum,
+  rather than a round trip per file. That matters: calls like
+  'adb push resource/*.json /data/local/tmp/app/resource --sync' routinely carry
+  a hundred small files, where stat'ing them one at a time dominates everything
+  else.
+
+  Args:
+    adb: Device side file system; its stat cache is filled as a side effect.
+    pairs: (local file, resolved remote path) as produced by ResolvePushDest.
+    use_checksums: Whether to compare contents of same-size files.
+
+  Returns:
+    (pairs that need transferring, how many were judged identical, the remote
+     directories that are known to exist).
+
+  Raises:
+    ChecksumUnavailable: if the device cannot produce checksums.
+  """
+  listed = {}  # type: Dict[bytes, bool]
+  for _, remote in pairs:
+    listed.setdefault(RemoteParent(remote), False)
+  for directory in listed:
+    try:
+      for _ in adb.listdir(directory):
+        pass
+      listed[directory] = True
+    except OSError:
+      # Absent or unreadable; everything below it counts as missing.
+      listed[directory] = False
+
+  needed = []  # type: List[Tuple[bytes, bytes]]
+  candidates = []  # type: List[Tuple[bytes, bytes]]
+  identical = 0
+  for local, remote in pairs:
+    directory = RemoteParent(remote)
+    remote_stat = None  # type: Optional[os.stat_result]
+    if listed[directory]:
+      remote_stat = adb.stat_cache.get(
+          StatCacheKey(directory, PushBasename(remote)))
+      if remote_stat is not None and stat.S_ISLNK(remote_stat.st_mode):
+        # 'ls -al' described the link, not its target; ask again, following it.
+        try:
+          remote_stat = adb.stat(remote)
+        except OSError:
+          remote_stat = None
+    if remote_stat is None or not stat.S_ISREG(remote_stat.st_mode):
+      # Missing, or something a file cannot simply overwrite. In the latter case
+      # the transfer will fail the way the real adb push fails.
+      needed.append((local, remote))
+      continue
+    try:
+      local_size = os.path.getsize(local)
+    except OSError:
+      needed.append((local, remote))
+      continue
+    if local_size != remote_stat.st_size:
+      needed.append((local, remote))
+    elif use_checksums:
+      candidates.append((local, remote))
+    else:
+      identical += 1
+
+  if candidates:
+    remote_checksums = adb.Checksums([remote for _, remote in candidates])
+    for local, remote in candidates:
+      if FileChecksum(local) == remote_checksums[remote]:
+        identical += 1
+      else:
+        needed.append((local, remote))
+
+  return needed, identical, {d for d, ok in listed.items() if ok}
+
+
+def JoinRemotePath(directory: bytes, name: bytes) -> bytes:
+  """Joins a remote directory and a relative BuildFileList name."""
+  if not name:
+    return directory
+  return directory.rstrip(b'/') + name
+
+
+def DeleteMirrorExtras(
+    adb: AdbFileSystem, directory: bytes, keep_names: Set[bytes],
+    dry_run: bool
+) -> int:
+  """Deletes remote children not named in keep_names.
+
+  This is the multi-file form of --mirror. `adb push a b DIR` has flat
+  destination semantics, so the source basenames are the complete desired
+  child set of DIR. The directory itself is never removed.
+
+  Returns:
+    The number of remote entries removed (or that would be removed).
+  """
+  entries = list(BuildFileList(adb, directory, False, b''))
+  if not entries or not stat.S_ISDIR(entries[0][1].st_mode):
+    return 0
+
+  extras = [
+      (name, statdata) for name, statdata in entries[1:]
+      if name.strip(b'/').split(b'/', 1)[0] not in keep_names
+  ]
+  # BuildFileList yields directories before their contents. Delete children
+  # before directories, and do not try to remove a directory twice after its
+  # parent has already been selected.
+  selected = []
+  selected_roots = set()  # type: Set[bytes]
+  for name, statdata in sorted(extras, key=lambda item: item[0].count(b'/'),
+                               reverse=True):
+    components = name.strip(b'/').split(b'/')
+    root_name = components[0] if components else name
+    if root_name in selected_roots:
+      continue
+    selected_roots.add(root_name)
+    selected.append((b'/' + root_name, statdata))
+
+  # Re-scan each selected subtree so files are removed before directories. The
+  # initial listing is retained for the common case and keeps the function
+  # cheap when the destination contains only flat files.
+  selected_names = {name for name, _ in selected}
+  deletions = []
+  for name, statdata in entries[1:]:
+    components = name.strip(b'/').split(b'/')
+    if components and b'/' + components[0] in selected_names:
+      deletions.append((name, statdata))
+  deletions.sort(
+      key=lambda item: (-item[0].count(b'/'), stat.S_ISDIR(item[1].st_mode)))
+
+  for name, statdata in deletions:
+    remote_name = JoinRemotePath(directory, name)
+    logging.info('Mirror-Delete: %r', remote_name)
+    if not dry_run:
+      if stat.S_ISDIR(statdata.st_mode):
+        adb.rmdir(remote_name)
+      else:
+        adb.unlink(remote_name)
+  return len(deletions)
+
+
+def RunBatchedPushes(adb_args: List[bytes], push_options: List[bytes],
+                     pairs: List[Tuple[bytes, bytes]],
+                     existing_directories: Set[bytes]) -> int:
+  """Transfer the given pairs using as few 'adb push' calls as possible.
+
+  Files that keep their name and land in a directory already known to exist are
+  grouped into one multi-source 'adb push' per directory, which is what turns a
+  hundred round trips into one. Anything else - a rename, or a destination whose
+  parent adb would have to create - is pushed on its own, because the grouped
+  form has different semantics there.
+
+  Args:
+    adb_args: The real adb plus its global options.
+    push_options: Options to repeat on every 'adb push'.
+    pairs: (local file, remote path) to transfer.
+    existing_directories: Remote directories known to exist.
+
+  Returns:
+    The exit status of the first failing push, or 0.
+  """
+  grouped = {}  # type: Dict[bytes, List[bytes]]
+  individual = []  # type: List[Tuple[bytes, bytes]]
+  for local, remote in pairs:
+    directory = RemoteParent(remote)
+    if (directory in existing_directories and
+        PushBasename(remote) == PushBasename(local)):
+      grouped.setdefault(directory, []).append(local)
+    else:
+      individual.append((local, remote))
+
+  for directory in sorted(grouped):
+    sources = grouped[directory]
+    for start in range(0, len(sources), MAX_PUSH_SOURCES):
+      chunk = sources[start:start + MAX_PUSH_SOURCES]
+      status = subprocess.call(adb_args + [b'push'] + push_options + chunk +
+                               [directory + b'/'])
+      if status != 0:
+        return status
+  for local, remote in individual:
+    status = subprocess.call(adb_args + [b'push'] + push_options +
+                             [local, remote])
+    if status != 0:
+      return status
+  return 0
+
+
+def RunRealAdbPush(adb_args: List[bytes], push_options: List[bytes],
+                   sources: List[bytes], destination: bytes) -> int:
+  """Run the real 'adb push' with the arguments as originally written."""
+  return subprocess.call(adb_args + [b'push'] + push_options + sources +
+                         [destination])
+
+
+def AdbCompatPushMain(argv: List[str]) -> int:
+  """Serve an 'adb push' call by syncing only the files that differ.
+
+  Args:
+    argv: Everything after '--adb-compat-push', i.e.
+      ['--real-adb', PATH, '--', <the original adb arguments>].
+
+  Returns:
+    A process exit status: 0 on success, 1 on any failure. Getting this right
+    matters more here than elsewhere - callers run under 'set -e', so returning
+    0 after a failure would carry the error silently into the next step.
+  """
+  real_adb = 'adb'
+  if argv and argv[0] == '--real-adb':
+    if len(argv) < 2:
+      logging.error('adb-sync: --real-adb requires an argument')
+      return 1
+    real_adb = argv[1]
+    argv = argv[2:]
+  if argv and argv[0] == '--':
+    argv = argv[1:]
+
+  quiet_environment = bool(os.environ.get('ADB_SYNC_QUIET'))
+  verbose = bool(os.environ.get('ADB_SYNC_VERBOSE'))
+  no_remote_delete = bool(os.environ.get('ADB_SYNC_NO_RM'))
+
+  bulk_percent = BULK_PUSH_PERCENT
+  configured_percent = os.environ.get('ADB_SYNC_BULK_PERCENT')
+  if configured_percent:
+    try:
+      bulk_percent = int(configured_percent)
+    except ValueError:
+      logging.warning('adb-sync: ignoring non-numeric ADB_SYNC_BULK_PERCENT=%r',
+                      configured_percent)
+
+  try:
+    call = ParseAdbPushArgv([os.fsencode(argument) for argument in argv])
+  except UsageError as error:
+    logging.error('adb-sync: %s', error)
+    return 1
+
+  quiet = call.quiet or quiet_environment
+  if quiet:
+    level = logging.CRITICAL
+    # The real 'adb push -q' says nothing at all, so silence the per-file pushes
+    # this mode makes underneath as well.
+    if b'-q' not in call.push_options:
+      call.push_options.append(b'-q')
+  elif verbose:
+    level = logging.INFO
+  else:
+    level = logging.WARNING
+  logging.basicConfig(level=level)
+
+  adb_args = [os.fsencode(real_adb)] + call.global_options
+  # Destinations that do not exist yet are normal here, and the device's 'ls'
+  # complains about them on stderr where the real adb push stays silent.
+  adb = AdbFileSystem(
+      adb_args,
+      push_args=call.push_options,
+      stderr=None if verbose else subprocess.DEVNULL)
+
+  try:
+    pairs = ResolvePushDest(adb, call.sources, call.destination)
+  except UsageError as error:
+    logging.error('adb-sync: %s', error)
+    return 1
+  destination_is_dir = False
+  if call.mirror:
+    stripped_destination = call.destination.rstrip(b'/') or b'/'
+    try:
+      destination_stat = adb.stat(stripped_destination)
+    except OSError:
+      destination_stat = None
+    destination_is_dir = (
+        destination_stat is not None and
+        stat.S_ISDIR(destination_stat.st_mode))
+
+  start_time = time.time()
+
+  # Directory sources go through FileSyncer, which knows how to walk a tree.
+  # Plain files are handled together instead: one listing per destination
+  # directory and one batched checksum, because a single call regularly names a
+  # hundred of them and a round trip each is what made this slow.
+  file_pairs = [pair for pair in pairs if not os.path.isdir(pair[0])]
+  directory_pairs = [pair for pair in pairs if os.path.isdir(pair[0])]
+
+  to_transfer = []  # type: List[Tuple[bytes, bytes]]
+  existing_directories = set()  # type: Set[bytes]
+  identical = 0
+  if file_pairs:
+    try:
+      try:
+        to_transfer, identical, existing_directories = PlanFilePushes(
+            adb, file_pairs)
+      except ChecksumUnavailable as error:
+        logging.warning(
+            'adb-sync: comparing contents is unavailable (%s); '
+            'falling back to comparing sizes', error)
+        to_transfer, identical, existing_directories = PlanFilePushes(
+            adb, file_pairs, use_checksums=False)
+    except OSError as error:
+      logging.error('adb-sync: failed to compare against %s: %s',
+                    os.fsdecode(call.destination), error)
+      return 1
+
+  def BuildSyncer(source: bytes, destination: bytes) -> FileSyncer:
+    return FileSyncer(
+        adb,
+        source,
+        destination,
+        local_to_remote=True,
+        remote_to_local=False,
+        # The underlying 'adb push' preserves mtime itself, and this script's
+        # own utime() is known not to work on Android.
+        preserve_times=False,
+        # Plain adb push never removes anything the source does not have.
+        # The explicit --mirror extension opts into reconciliation.
+        delete_missing=call.mirror,
+        allow_overwrite=True,
+        # adb push replaces whatever is in the way, apart from the cases
+        # ResolvePushDest already rejected. With ADB_SYNC_NO_RM the promise is
+        # that ordinary pushes do not delete device entries; --mirror is an
+        # explicit opt-in and is allowed to reconcile its destination.
+        allow_replace=not no_remote_delete or call.mirror,
+        # adb push follows local symlinks; comparing the link itself would use
+        # the link's own size and misjudge whether it changed.
+        copy_links=True,
+        dry_run=call.dry_run,
+        checksum=True)
+
+  # Scan the directories first too, so that the choice between transferring file
+  # by file and handing the whole push to adb is made before anything is touched.
+  scanned = []  # type: List[Tuple[FileSyncer, bytes, bytes]]
+  tree_differing = 0
+  tree_files = 0
+  for source, destination in directory_pairs:
+    syncer = BuildSyncer(source, destination)
+    # IsWorking() costs two extra round trips and the real adb push makes no such
+    # check; a broken connection surfaces from the first 'ls' anyway.
+    if verbose and not syncer.IsWorking():
+      logging.error('adb-sync: device not connected or not working')
+      return 1
+    try:
+      try:
+        syncer.ScanAndDiff()
+      except ChecksumUnavailable as error:
+        logging.warning(
+            'adb-sync: comparing contents is unavailable (%s); '
+            'falling back to comparing sizes', error)
+        syncer.checksum = False
+        syncer.checksum_different.clear()
+        syncer.ScanAndDiff()
+    except OSError as error:
+      logging.error('adb-sync: failed to compare %s with %s: %s',
+                    os.fsdecode(source), os.fsdecode(destination), error)
+      return 1
+    differing, local_files = CountDifferingFiles(syncer)
+    scanned.append((syncer, source, destination))
+    tree_differing += differing
+    tree_files += local_files
+
+  mirror_deletions = 0
+  if call.mirror and file_pairs and (len(call.sources) > 1 or
+                                     destination_is_dir):
+    # A multi-source push, or a file pushed into an existing directory, mirrors
+    # that destination directory. A single file pushed to an absent/renamed
+    # destination is still a file operation and has no directory to mirror.
+    file_destinations = {}  # type: Dict[bytes, Set[bytes]]
+    for _, remote in file_pairs:
+      parent = RemoteParent(remote)
+      file_destinations.setdefault(parent, set()).add(PushBasename(remote))
+    for parent, keep_names in file_destinations.items():
+      try:
+        parent_stat = adb.stat(parent)
+      except OSError:
+        continue
+      if stat.S_ISDIR(parent_stat.st_mode):
+        try:
+          mirror_deletions += DeleteMirrorExtras(
+              adb, parent, keep_names, call.dry_run)
+        except OSError as error:
+          logging.error('adb-sync: failed to mirror %s: %s',
+                        os.fsdecode(parent), error)
+          return 1
+
+  # Whole trees are still transferred one file at a time, so when most of a tree
+  # differs it is cheaper to replay the original command and let adb stream it.
+  # The batched form above already makes this unnecessary for plain files.
+  if (not call.mirror and not call.dry_run and
+      tree_differing >= BULK_PUSH_MIN_FILES and
+      tree_differing * 100 >= tree_files * bulk_percent):
+    if not quiet:
+      print('adb-sync: %d of %d files in the directories differ, '
+            'letting adb push everything' % (tree_differing, tree_files))
+    return RunRealAdbPush(adb_args, call.push_options, call.sources,
+                          call.destination)
+
+  pushed = len(to_transfer)
+  transferred_bytes = 0
+  for local, _ in to_transfer:
+    try:
+      transferred_bytes += os.path.getsize(local)
+    except OSError:
+      pass
+  if to_transfer and not call.dry_run:
+    status = RunBatchedPushes(adb_args, call.push_options, to_transfer,
+                              existing_directories)
+    if status != 0:
+      return status
+
+  tree_pushed = 0
+  for syncer, source, destination in scanned:
+    try:
+      if call.mirror:
+        deleted_before = len(syncer.remote_only)
+        syncer.PerformDeletions()
+        mirror_deletions += deleted_before
+      syncer.PerformOverwrites()
+      # PerformOverwrites prepends the files that need replacing to local_only,
+      # which is src_only[0], so this is the full set about to be transferred.
+      tree_pushed += CountFileEntries(syncer.local_only)
+      syncer.PerformCopies()
+    except OSError as error:
+      logging.error('adb-sync: failed to push %s to %s: %s',
+                    os.fsdecode(source), os.fsdecode(destination), error)
+      return 1
+    transferred_bytes += syncer.num_bytes
+  pushed += tree_pushed
+  identical += max(0, tree_files - tree_pushed)
+
+  if not quiet:
+    elapsed = time.time() - start_time
+    mirror_suffix = ''
+    if call.mirror:
+      mirror_suffix = ', %d extra deleted%s' % (
+          mirror_deletions, ' (dry run)' if call.dry_run else '')
+    print('adb-sync: %d file%s pushed, %d identical. %d bytes in %.3fs%s' %
+          (pushed, '' if pushed == 1 else 's', identical, transferred_bytes,
+           elapsed, mirror_suffix or (' (dry run)' if call.dry_run else '')))
+  return 0
+
+
+def main() -> None:
+  # Dispatch before argparse: the adb-compatible mode follows adb's own option
+  # grammar, in which -e, -t and -s mean different things than they do below.
+  # Keeping the two apart is what leaves the existing command line untouched.
+  if len(sys.argv) > 1 and sys.argv[1] == '--adb-compat-push':
+    sys.exit(AdbCompatPushMain(sys.argv[2:]))
+
+  logging.basicConfig(level=logging.INFO)
+
+  parser = argparse.ArgumentParser(
+      description='Synchronize a directory between an Android device and the '
+      'local file system')
+  parser.add_argument('--version', action='version',
+                      version='adb-sync %s' % ADB_SYNC_VERSION)
+  parser.add_argument(
+      'source',
+      metavar='SRC',
+      type=str,
+      nargs='+',
+      help='The directory to read files/directories from. '
+      'This must be a local path if -R is not specified, '
+      'and an Android path if -R is specified. If SRC does '
+      'not end with a final slash, its last path component '
+      'is appended to DST (like rsync does).')
+  parser.add_argument(
+      'destination',
+      metavar='DST',
+      type=str,
+      help='The directory to write files/directories to. '
+      'This must be an Android path if -R is not specified, '
+      'and a local path if -R is specified.')
+  parser.add_argument(
+      '-e',
+      '--adb',
+      metavar='COMMAND',
+      default='adb',
+      type=str,
+      help='Use the given adb binary and arguments.')
+  parser.add_argument(
+      '--device',
+      action='store_true',
+      help='Directs command to the only connected USB device; '
+      'returns an error if more than one USB device is present. '
+      'Corresponds to the "-d" option of adb.')
+  parser.add_argument(
+      '--emulator',
+      action='store_true',
+      help='Directs command to the only running emulator; '
+      'returns an error if more than one emulator is running. '
+      'Corresponds to the "-e" option of adb.')
+  parser.add_argument(
+      '-s',
+      '--serial',
+      metavar='DEVICE',
+      type=str,
+      help='Directs command to the device or emulator with '
+      'the given serial number or qualifier. Overrides '
+      'ANDROID_SERIAL environment variable. Use "adb devices" '
+      'to list all connected devices with their respective serial number. '
+      'Corresponds to the "-s" option of adb.')
+  parser.add_argument(
+      '-H',
+      '--host',
+      metavar='HOST',
+      type=str,
+      help='Name of adb server host (default: localhost). '
+      'Corresponds to the "-H" option of adb.')
+  parser.add_argument(
+      '-P',
+      '--port',
+      metavar='PORT',
+      type=str,
+      help='Port of adb server (default: 5037). '
+      'Corresponds to the "-P" option of adb.')
+  parser.add_argument(
+      '-R',
+      '--reverse',
+      action='store_true',
+      help='Reverse sync (pull, not push).')
+  parser.add_argument(
+      '-2',
+      '--two-way',
+      action='store_true',
+      help='Two-way sync (compare modification time; after '
+      'the sync, both sides will have all files in the '
+      'respective newest version. This relies on the clocks '
+      'of your system and the device to match.')
+  parser.add_argument(
+      '-t',
+      '--times',
+      action='store_true',
+      help='Preserve modification times when copying.')
+  parser.add_argument(
+      '-d',
+      '--delete',
+      action='store_true',
+      help='Delete files from DST that are not present on '
+           'SRC. Mutually exclusive with -2.')
+  parser.add_argument(
+      '--mirror',
+      action='store_true',
+      help='Mirror SRC into DST, deleting destination entries absent from '
+           'SRC. This is an explicit alias for --delete.')
+  parser.add_argument(
+      '-f',
+      '--force',
+      action='store_true',
+      help='Allow deleting files/directories when having to '
+      'replace a file by a directory or vice versa. This is '
+      'disabled by default to prevent large scale accidents.')
+  parser.add_argument(
+      '-n',
+      '--no-clobber',
+      action='store_true',
+      help='Do not ever overwrite any '
+      'existing files. Mutually exclusive with -f.')
+  parser.add_argument(
+      '-L',
+      '--copy-links',
+      action='store_true',
+      help='transform symlink into referent file/dir')
+  parser.add_argument(
+      '--dry-run',
+      action='store_true',
+      help='Do not do anything - just show what would be done.')
+  parser.add_argument(
+      '-c',
+      '--checksum',
+      action='store_true',
+      help='Compare file contents instead of relying only on file size. '
+      'This is more accurate, but requires reading same-size files on '
+      'both sides.')
+  args = parser.parse_args()
+
+  localpatterns = [os.fsencode(x) for x in args.source]
+  remotepath = os.fsencode(args.destination)
+  adb_args = os.fsencode(args.adb).split(b' ')
+  if args.device:
+    adb_args += [b'-d']
+  if args.emulator:
+    adb_args += [b'-e']
+  if args.serial:
+    adb_args += [b'-s', os.fsencode(args.serial)]
+  if args.host:
+    adb_args += [b'-H', os.fsencode(args.host)]
+  if args.port:
+    adb_args += [b'-P', os.fsencode(args.port)]
+  adb = AdbFileSystem(adb_args)
+
+  # Expand wildcards, but only on the remote side.
+  localpaths = []
+  remotepaths = []
+  if args.reverse:
+    for pattern in localpatterns:
+      for src in ExpandWildcards(adb, pattern):
+        src, dst = FixPath(src, remotepath)
+        localpaths.append(src)
+        remotepaths.append(dst)
+  else:
+    for src in localpatterns:
+      src, dst = FixPath(src, remotepath)
+      localpaths.append(src)
+      remotepaths.append(dst)
+
+  preserve_times = args.times
+  delete_missing = args.delete or args.mirror
+  allow_replace = args.force
+  allow_overwrite = not args.no_clobber
+  copy_links = args.copy_links
+  dry_run = args.dry_run
+  checksum = args.checksum
+  local_to_remote = True
+  remote_to_local = False
+  if args.two_way:
+    local_to_remote = True
+    remote_to_local = True
+  if args.reverse:
+    local_to_remote, remote_to_local = remote_to_local, local_to_remote
+    localpaths, remotepaths = remotepaths, localpaths
+  if allow_replace and not allow_overwrite:
+    logging.error('--no-clobber and --force are mutually exclusive.')
+    parser.print_help()
+    return
+  if delete_missing and local_to_remote and remote_to_local:
+    logging.error('--delete and --two-way are mutually exclusive.')
+    parser.print_help()
+    return
+
+  # Two-way sync is only allowed with disjoint remote and local path sets.
+  if (remote_to_local and local_to_remote) or delete_missing:
+    if ((remote_to_local and len(localpaths) != len(set(localpaths))) or
+        (local_to_remote and len(remotepaths) != len(set(remotepaths)))):
+      logging.error(
+          '--two-way and --delete are only supported for disjoint sets of '
+          'source and destination paths (in other words, all SRC must '
+          'differ in basename).')
+      parser.print_help()
+      return
+
+  for i in range(len(localpaths)):
+    logging.info('Sync: local %r, remote %r', localpaths[i], remotepaths[i])
+    syncer = FileSyncer(adb, localpaths[i], remotepaths[i], local_to_remote,
+                        remote_to_local, preserve_times, delete_missing,
+                        allow_overwrite, allow_replace, copy_links, dry_run,
+                        checksum)
+    if not syncer.IsWorking():
+      logging.error('Device not connected or not working.')
+      return
+    try:
+      syncer.ScanAndDiff()
+      syncer.PerformDeletions()
+      syncer.PerformOverwrites()
+      syncer.PerformCopies()
+    finally:
+      syncer.TimeReport()
+
+
+if __name__ == '__main__':
+  main()

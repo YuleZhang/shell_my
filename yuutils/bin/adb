@@ -1,0 +1,267 @@
+#!/bin/sh
+
+# Copyright 2026 zhangyu09. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A drop-in front end for 'adb'.
+#
+# Put this directory on PATH ahead of the real adb - 'source adbsync-env.sh'
+# does that - and existing 'adb ...' calls keep working unchanged. Everything is
+# exec'd straight through to the real adb, argument for argument, except:
+#
+#   adb push ...   goes to adb-sync, which compares checksums and only transfers
+#                  files whose contents actually differ.
+#   adb shell ...  has 'rm' shadowed by a no-op function, but only when
+#                  ADB_SYNC_NO_RM is set.
+#
+# Deliberately written in sh, not Python: a pipeline run makes several hundred
+# pass-through adb calls, and a Python front end would add ~90ms of interpreter
+# startup to each one (~72s per run) where sh adds ~2.6ms.
+#
+# The pass-through path uses shell builtins only - no dirname, tr or readlink -
+# because callers narrow PATH ('export PATH=/some/sdk/bin') often enough that
+# depending on external tools here would break them.
+#
+# Environment:
+#   ADB_SYNC_DISABLE=1    Bypass everything; behave exactly like the real adb.
+#   ADB_SYNC_NO_RM=1      Turn 'rm' into a no-op inside 'adb shell' commands.
+#                         adbsync-env.sh switches this on; ADB_SYNC_NO_RM=0
+#                         turns it back off.
+#   ADB_SYNC_REAL_ADB=P   Use P as the real adb instead of searching PATH.
+#   ADB_SYNC_SCRIPT=P     Use P as adb-sync instead of looking next to this
+#                         script and then on PATH.
+#   ADB_SYNC_VERBOSE=1    Trace the dispatch decision to stderr.
+
+set -u
+
+# Whether a switch is on. '0', 'no', 'false', 'off' and empty all mean off, so
+# that a caller can turn something off without unsetting it - adbsync-env.sh
+# turns ADB_SYNC_NO_RM on by default, and 'ADB_SYNC_NO_RM=0' has to undo that.
+Enabled() {
+  case "${1:-}" in
+    '' | 0 | no | NO | No | false | FALSE | False | off | OFF | Off)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+vlog() {
+  if Enabled "${ADB_SYNC_VERBOSE:-}"; then
+    printf 'adb-sync[shim]: %s\n' "$*" >&2
+  fi
+  :
+}
+
+die() {
+  printf 'adb-sync[shim]: %s\n' "$*" >&2
+  exit 1
+}
+
+# Find the real adb: walk PATH but skip ourselves. 'which adb' / 'command -v adb'
+# cannot be used - they would find this script and we would call ourselves
+# forever. The self test is '-ef', which compares device and inode, so it holds
+# whether we were reached directly, through a symlink, or via a relative path.
+real_adb=${ADB_SYNC_REAL_ADB:-}
+if [ -z "$real_adb" ]; then
+  saved_ifs=$IFS
+  IFS=:
+  set -f
+  for dir in $PATH; do
+    [ -n "$dir" ] || dir=.
+    if [ -x "$dir/adb" ] && ! [ "$dir/adb" -ef "$0" ]; then
+      real_adb=$dir/adb
+      break
+    fi
+  done
+  set +f
+  IFS=$saved_ifs
+fi
+[ -n "$real_adb" ] || die "no real adb found on PATH (set ADB_SYNC_REAL_ADB)"
+[ -x "$real_adb" ] || die "real adb '$real_adb' is not executable"
+
+# Introspection hook for adbsync-env.sh. Not an adb option, so it cannot collide.
+if [ "${1:-}" = --adb-sync-which-real ]; then
+  printf '%s\n' "$real_adb"
+  exit 0
+fi
+
+if Enabled "${ADB_SYNC_DISABLE:-}"; then
+  vlog "disabled, exec $real_adb"
+  exec "$real_adb" "$@"
+fi
+
+# Locate the subcommand by consuming adb's own global options, without touching
+# "$@" - the pass-through path below must hand the original arguments to the real
+# adb untouched.
+sub=
+nglobal=0
+want_value=0
+for arg in "$@"; do
+  if [ "$want_value" = 1 ]; then
+    want_value=0
+    nglobal=$((nglobal + 1))
+    continue
+  fi
+  case "$arg" in
+    -s | -t | -H | -P | -L | --one-device)
+      want_value=1
+      nglobal=$((nglobal + 1))
+      ;;
+    -a | -d | -e | --exit-on-write-error)
+      nglobal=$((nglobal + 1))
+      ;;
+    *)
+      sub=$arg
+      break
+      ;;
+  esac
+done
+
+# adb push -> adb-sync. The whole original argv is forwarded; adb-sync parses the
+# adb grammar itself, which keeps serials like '10.0.0.1:5555' out of sh word
+# splitting. --real-adb is what stops the recursion: adb-sync shells out to
+# 'adb shell ls -al' and 'adb push' internally, and those must not come back
+# through this script.
+HandOffPush() {
+  # Only this path needs our own location, so the external tools live here rather
+  # than in the pass-through path above.
+  self=$(readlink -f -- "$0" 2>/dev/null) || self=
+  [ -n "$self" ] || self=$0
+  self_dir=${self%/*}
+  [ "$self_dir" = "$self" ] && self_dir=.
+
+  # Where adb-sync sits relative to us depends on how this was installed:
+  #   ../adb-sync         source checkout, this script being <root>/bin/adb
+  #   ./adb-sync          both copied into the same directory by hand
+  #   ../../bin/adb-sync  pip install, this script being
+  #                       <prefix>/yuutils-support/bin/adb and the console
+  #                       script <prefix>/bin/adb-sync
+  # PATH is the last resort and is safe to search here, unlike for the real adb
+  # above: 'adb-sync' is not our own name, so it cannot find this script.
+  adbsync=${ADB_SYNC_SCRIPT:-}
+  if [ -n "$adbsync" ]; then
+    [ -x "$adbsync" ] || die "ADB_SYNC_SCRIPT '$adbsync' is not executable"
+  else
+    for candidate in "$self_dir/../adb-sync" "$self_dir/adb-sync" \
+                     "$self_dir/../../bin/adb-sync"; do
+      if [ -x "$candidate" ]; then
+        adbsync=$candidate
+        break
+      fi
+    done
+    if [ -z "$adbsync" ]; then
+      adbsync=$(command -v adb-sync 2>/dev/null) || adbsync=
+    fi
+  fi
+  [ -n "$adbsync" ] || die "cannot find adb-sync near $self or on PATH (set ADB_SYNC_SCRIPT)"
+
+  if [ "${ADB_SYNC_SHIM_DEPTH:-0}" -ge 2 ]; then
+    die "recursion detected (depth ${ADB_SYNC_SHIM_DEPTH:-0}); set ADB_SYNC_REAL_ADB"
+  fi
+  ADB_SYNC_SHIM_DEPTH=$((${ADB_SYNC_SHIM_DEPTH:-0} + 1))
+  export ADB_SYNC_SHIM_DEPTH
+
+  vlog "push -> $adbsync (real adb $real_adb)"
+  exec "$adbsync" --adb-compat-push --real-adb "$real_adb" -- "$@"
+}
+
+# adb shell <command> -> same command with 'rm' shadowed. The command string is
+# rebuilt by joining the remaining arguments with single spaces, which is exactly
+# what adb itself does before handing them to the device's shell, so the device
+# sees no change apart from the added function.
+#
+# Shadowing rather than rewriting the string means compound commands
+# ('cd d; rm -rf output; ./run') are covered without parsing anything.
+RewriteShell() {
+  keep=$((nglobal + 1))
+
+  # Step over shell's own options so only the command part gets rewritten.
+  index=0
+  want_value=0
+  for arg in "$@"; do
+    index=$((index + 1))
+    [ "$index" -le "$keep" ] && continue
+    if [ "$want_value" = 1 ]; then
+      want_value=0
+      keep=$((keep + 1))
+      continue
+    fi
+    case "$arg" in
+      -e)
+        want_value=1
+        keep=$((keep + 1))
+        ;;
+      -n | -T | -t | -tt | -x)
+        keep=$((keep + 1))
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  total=$#
+  ncommand=$((total - keep))
+  if [ "$ncommand" -le 0 ]; then
+    # Interactive shell, nothing to rewrite.
+    return
+  fi
+
+  command_string=
+  index=0
+  for arg in "$@"; do
+    index=$((index + 1))
+    [ "$index" -le "$keep" ] && continue
+    if [ -z "$command_string" ]; then
+      command_string=$arg
+    else
+      command_string="$command_string $arg"
+    fi
+  done
+
+  # Drop the command arguments, keeping globals + 'shell' + shell options: rotate
+  # the part to keep to the end, then shift the command words away.
+  index=0
+  while [ "$index" -lt "$keep" ]; do
+    set -- "$@" "$1"
+    shift
+    index=$((index + 1))
+  done
+  index=0
+  while [ "$index" -lt "$ncommand" ]; do
+    shift
+    index=$((index + 1))
+  done
+
+  no_rm='rm() { echo "adb-sync: suppressed on device: rm $*" >&2; }; '
+  vlog "shell: rm suppressed"
+  exec "$real_adb" "$@" "$no_rm$command_string"
+}
+
+case "$sub" in
+  push)
+    HandOffPush "$@"
+    ;;
+  shell)
+    if Enabled "${ADB_SYNC_NO_RM:-}"; then
+      RewriteShell "$@"
+    fi
+    ;;
+esac
+
+vlog "pass through '$sub' to $real_adb"
+exec "$real_adb" "$@"
