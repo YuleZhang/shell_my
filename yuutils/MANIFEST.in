@@ -1,0 +1,12 @@
+include LICENSE.md
+include README.md
+include adb-sync
+include adb-channel
+include adbsync-env.sh
+include bin/adb
+include utils/power_boost.py
+include utils/parse_infer_stack.py
+include myenv/omp/config.yml
+include myenv/omp/models.yml
+include myenv/zsh/install_zsh_env.sh
+include myenv/zsh/test_install_zsh_env.sh
