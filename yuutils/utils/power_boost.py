@@ -185,15 +185,23 @@ def format_unlock_actions(actions: Sequence[tuple[str, str]]) -> str:
     if not actions:
         return ""
     lines = ["为达到峰值频率所做的平台改动:"]
+    reboot_required = False
     for kind, detail in actions:
         if kind == "service":
             lines.append(f"  已停止服务: {detail}")
+        elif kind == "cpu_limits":
+            lines.append(f"  已写入不可逆的 CPU 限制节点: {detail}")
+            reboot_required = True
         else:
             lines.append(f"  已放开 {kind}: {detail}")
-    lines.append(
-        "  注意: 温控守护进程已停止，设备不再有热保护。跑完请执行"
-        " power_boost.py --restore 恢复。"
-    )
+    lines.append("  注意: 温控守护进程已停止，设备不再有热保护。")
+    if reboot_required:
+        lines.append(
+            "  注意: CPU 限制节点无法可靠回写，完成测试后需要重启设备；"
+            " --restore 只恢复可持久化的服务、频率和 vendor 节点状态。"
+        )
+    else:
+        lines.append("  跑完请执行 power_boost.py --restore 恢复。")
     return "\n".join(lines)
 
 
@@ -203,6 +211,7 @@ set -u
 POLICY_FILE=/data/local/tmp/power_boost_policies.$$
 STOPPED_FILE=/data/local/tmp/power_boost_stopped
 GOVERNOR_FILE=/data/local/tmp/power_boost_governors
+VENDOR_STATE_FILE=/data/local/tmp/power_boost_vendor_state
 trap 'rm -f "$POLICY_FILE"' EXIT
 
 is_number() {
@@ -341,11 +350,38 @@ stop_blockers() {
         fi
     done
 
+    # Save vendor state before changing it. Keep the file across repeated
+    # boosts so a second invocation cannot replace the original values with
+    # already-modified ones.
+    vendor_state_ready=1
+    if [ ! -e "$VENDOR_STATE_FILE" ]; then
+        if ! : > "$VENDOR_STATE_FILE" 2>/dev/null; then
+            vendor_state_ready=0
+        else
+            for path in /sys/devices/hn-cpu-cdev-*/set_freq; do
+                [ -e "$path" ] || continue
+                value="$(cat "$path" 2>/dev/null || true)"
+                printf 'set_freq|%s|%s\n' "$path" "$value" \
+                    >> "$VENDOR_STATE_FILE" 2>/dev/null || vendor_state_ready=0
+            done
+            perfserv=/proc/powerhal_cpu_ctrl/perfserv_freq
+            if [ -r "$perfserv" ]; then
+                value="$(cat "$perfserv" 2>/dev/null || true)"
+                printf 'perfserv|%s|%s\n' "$perfserv" "$value" \
+                    >> "$VENDOR_STATE_FILE" 2>/dev/null || vendor_state_ready=0
+            fi
+        fi
+    fi
+
     # Some vendor kernels apply CPU limits through cooling-device caps rather
     # than an init service. Only clear these after normal CPUFreq writes fail.
-    for path in /sys/devices/hn-cpu-cdev-*/set_freq; do
-        [ -e "$path" ] && echo 0 > "$path" 2>/dev/null || true
-    done
+    if [ "$vendor_state_ready" -eq 1 ]; then
+        for path in /sys/devices/hn-cpu-cdev-*/set_freq; do
+            [ -e "$path" ] && echo 0 > "$path" 2>/dev/null || true
+        done
+    else
+        printf 'U|vendor|state file unavailable; skipped set_freq and perfserv changes\n'
+    fi
 
     # HONOR's power HAL keeps a separate per-core CPUFreq QoS ceiling.
     perfserv=/proc/powerhal_cpu_ctrl/perfserv_freq
@@ -360,7 +396,8 @@ stop_blockers() {
         expected=$((expected + count * 2))
     done < "$POLICY_FILE"
     actual="$(cat "$perfserv" 2>/dev/null | wc -w)"
-    if [ "$shared" -eq 1 ] && [ "$actual" -eq "$expected" ]; then
+    if [ "$vendor_state_ready" -eq 1 ] &&
+        [ "$shared" -eq 1 ] && [ "$actual" -eq "$expected" ]; then
         while IFS='|' read -r policy target; do
             for cpu in $(cpu_list "$policy"); do
                 printf '%s %s %s' "$cpu" "$target" "$target" > "$perfserv"
@@ -429,6 +466,7 @@ set -u
 
 STOPPED_FILE=/data/local/tmp/power_boost_stopped
 GOVERNOR_FILE=/data/local/tmp/power_boost_governors
+VENDOR_STATE_FILE=/data/local/tmp/power_boost_vendor_state
 
 # Prefer the governor recorded before the boost. Falling back to a hardcoded
 # list is a guess, so it is reported as one; leaving "performance" in place
@@ -460,6 +498,27 @@ restore_governor() {
     return 1
 }
 
+restore_vendor_state() {
+    restore_failed=0
+    if [ -s "$VENDOR_STATE_FILE" ]; then
+        while IFS='|' read -r kind path value; do
+            [ -n "$kind" ] || continue
+            case "$kind" in
+                set_freq|perfserv)
+                    if printf '%s\n' "$value" > "$path" 2>/dev/null; then
+                        printf 'R|vendor|%s restored: %s\n' "$kind" "$path"
+                    else
+                        printf 'R|vendor|%s restore failed: %s\n' "$kind" "$path"
+                        restore_failed=1
+                    fi
+                    ;;
+            esac
+        done < "$VENDOR_STATE_FILE"
+    fi
+    rm -f "$VENDOR_STATE_FILE" 2>/dev/null || true
+    return "$restore_failed"
+}
+
 if [ -s "$STOPPED_FILE" ]; then
     while read -r service; do
         [ -n "$service" ] || continue
@@ -468,6 +527,9 @@ if [ -s "$STOPPED_FILE" ]; then
     done < "$STOPPED_FILE"
     rm -f "$STOPPED_FILE" 2>/dev/null || true
 fi
+
+vendor_restore_failed=0
+restore_vendor_state || vendor_restore_failed=1
 
 for policy in /sys/devices/system/cpu/cpufreq/policy*; do
     [ -d "$policy" ] || continue
@@ -487,6 +549,10 @@ done
 
 rm -f "$GOVERNOR_FILE" 2>/dev/null || true
 
+if [ "$vendor_restore_failed" -ne 0 ]; then
+    printf 'DONE|FAIL|one or more vendor states could not be restored\n'
+    exit 1
+fi
 printf 'DONE|OK\n'
 """
 
@@ -774,8 +840,9 @@ def main() -> int:
         "--restore",
         action="store_true",
         help="undo a previous boost: restart the thermal/power daemons this "
-        "script stopped, unpin every policy and hand frequency selection back "
-        "to the platform governor (Android only)",
+        "script stopped, restore saved vendor limit nodes, unpin every policy "
+        "and hand frequency selection back to the platform governor "
+        "(Android only)",
     )
     args = parser.parse_args()
 
