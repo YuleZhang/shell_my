@@ -33,6 +33,19 @@ codex exec --skip-git-repo-check PROXY_OK </dev/null
 
 模型列表由当前登录的 ChatGPT 账户下发。把不在 `codex debug models` 输出中的模型名写进 `config.toml` 不会增加模型权限，只会在请求阶段得到“不支持该模型”的错误。
 
+## 切换 ChatGPT 账户
+
+Codex CLI 使用共享的后台 app-server daemon。执行退出和重新登录后，已经运行的 daemon 可能仍保留旧账户状态，因此切换账户时应显式重启：
+
+```bash
+codex logout
+codex login --device-auth
+codex app-server daemon restart
+codex login status
+```
+
+如果登录文件的更新时间晚于 daemon 的启动时间，而 TUI 仍显示旧账户，通常就是 daemon 尚未重新加载凭据。不要删除 `auth.json`；正常重启 daemon 即可。
+
 开发者可在 Linux 上运行隔离测试：
 
 ```bash
