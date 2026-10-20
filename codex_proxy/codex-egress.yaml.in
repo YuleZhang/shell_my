@@ -1,0 +1,34 @@
+mixed-port: 17891
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: warning
+
+proxies:
+  - name: UPSTREAM
+    type: http
+    server: @UPSTREAM_HOST@
+    port: @UPSTREAM_PORT@
+    tls: false
+
+proxy-groups:
+  - name: AI-EGRESS
+    type: select
+    proxies:
+      - UPSTREAM
+
+rules:
+  - DOMAIN,localhost,DIRECT
+  - DOMAIN-SUFFIX,localhost,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,chatgpt.com,AI-EGRESS
+  - DOMAIN-SUFFIX,openai.com,AI-EGRESS
+  - DOMAIN-SUFFIX,oaistatic.com,AI-EGRESS
+  - DOMAIN-SUFFIX,oaiusercontent.com,AI-EGRESS
+  - DOMAIN-SUFFIX,anthropic.com,AI-EGRESS
+  - DOMAIN-SUFFIX,claude.ai,AI-EGRESS
+  - DOMAIN-SUFFIX,claude.com,AI-EGRESS
+  - MATCH,DIRECT
