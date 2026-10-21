@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db*
+*.bak
+coverage/
+test-results/
+playwright-report/
+*.log
+web/build-check/
+web/tests/*.png
+web/tests/browser-receipt.json
+__pycache__/
