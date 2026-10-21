@@ -13,6 +13,7 @@ NEW_TOOLS = (
     'utils/run_siq_benchmark.py',
     'utils/process_sdk_log.py',
     'utils/scripts_merge_mpool_csv_to_perfetto.py',
+    'utils/stepcode-claude-watch.py',
 )
 
 
@@ -43,6 +44,10 @@ class YuutilsReleaseTest(unittest.TestCase):
     self.assertNotIn('/home/zhangyu', source)
     self.assertIn('find_companion_tool', source)
     self.assertIn('find_adbsync_env', source)
+
+  def test_packaged_watcher_has_no_author_home_path(self):
+    source = (HERE / 'utils/stepcode-claude-watch.py').read_text(encoding='utf-8')
+    self.assertNotRegex(source, r'/home/[^/\s]+')
 
   def test_readme_uses_current_server_and_pinned_version(self):
     readme = (HERE / 'README.md').read_text(encoding='utf-8')

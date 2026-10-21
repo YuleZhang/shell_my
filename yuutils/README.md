@@ -2,7 +2,7 @@
 
 `yuutils` 是从 [`shell_my`](https://github.com/YuleZhang/shell_my) 独立发布的
 Shell 与设备工具合集。它包含 `adb-sync`、可替换 `adb` 前端、SIQ benchmark
-工具链、堆栈解析工具以及共享的 `myenv` 配置。
+工具链、堆栈解析工具、Herdr 会话恢复监控以及共享的 `myenv` 配置。
 
 ## 安装
 
@@ -107,6 +107,35 @@ source "$(adb-sync-env)" off
 如需使用独立安装的 adb-sync，可设置 `ADB_SYNC_SCRIPT`。
 
 `adb-sync` 本身仍保持独立版本与测试；yuutils 版本表示本次工具集合快照的版本。
+
+## Herdr 会话恢复监控（1.5.1 待发布）
+
+当前公开发布版本仍为 1.5.0；`stepcode-claude-watch.py` 从 1.5.1 起加入 yuutils。
+发布前，可从本仓库安装包含它的源码版本：
+
+```bash
+python3 -m pip install ./yuutils
+```
+
+运行环境需为 Linux，且 `herdr` 和 `stepcode` 命令可从 `PATH` 找到；查看日志还需
+系统的 `tail` 命令。监控必须在 Herdr 管理的终端中启动；`stepcode usage` 还需
+已配置当前用户的 API 凭据。凭据由 StepCode 自行读取，不传给脚本，也不会写入
+yuutils 包。
+
+```bash
+stepcode-claude-watch.py start
+stepcode-claude-watch.py status
+stepcode-claude-watch.py log -n 30
+stepcode-claude-watch.py stop
+```
+
+如果已有旧版监控进程，先执行 `stop`，再执行 `start`，让新进程加载更新后的脚本。
+
+监控每 5 秒检查 Herdr 中的 Claude 和 StepCode pane。Claude 的 504 重试、StepCode
+服务过载重试耗尽会触发恢复；StepCode 的 429 `Rate limit exceeded` 仅在
+`stepcode usage` 显示至少一项正余额时发送 `continue`。余额为零、查询失败或输出
+无法识别时跳过，每 60 秒重新检查。日志和 PID 位于当前用户的
+`~/.local/state/stepcode-claude-watch.*`。
 
 ## 其他已安装内容
 

@@ -10,3 +10,5 @@ include utils/parse_infer_stack.py
 include utils/run_siq_benchmark.py
 include utils/process_sdk_log.py
 include utils/scripts_merge_mpool_csv_to_perfetto.py
+include utils/stepcode-claude-watch.py
+include test_stepcode_claude_watch.py

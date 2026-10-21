@@ -50,6 +50,8 @@ TOOLS = [
     Tool('scripts_merge_mpool_csv_to_perfetto.py', 'script',
          'utils/scripts_merge_mpool_csv_to_perfetto.py',
          'Overlay memory CSV counters onto a Perfetto trace.'),
+    Tool('stepcode-claude-watch.py', 'script', 'utils/stepcode-claude-watch.py',
+         'Recover Herdr Claude and StepCode sessions after terminal API errors.'),
     Tool('install_zsh_env.sh', 'script', 'myenv/zsh/install_zsh_env.sh',
          'Install the shared zsh environment and optional completions.'),
     Tool('test_install_zsh_env.sh', 'script',
