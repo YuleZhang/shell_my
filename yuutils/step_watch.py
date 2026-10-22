@@ -18,8 +18,6 @@ import time
 import tty
 from pathlib import Path
 
-import pyte
-
 OVERLOADED = (r"(?:server_error:\s*)?Our\s+servers\s+are\s+currently\s+"
               r"overloaded\.\s*Please\s+try\s+again\s+later\.")
 OVERLOAD_RETRY_FAILED = re.compile(
@@ -284,6 +282,10 @@ def write_all(fd, data):
 
 
 def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
+    try:
+        import pyte
+    except ImportError:
+        raise RuntimeError('PTY run requires pyte; install yuutils dependencies with pip') from None
     uid = current_uid()
     if not sys.platform.startswith('linux') or not os.isatty(0) or not os.isatty(1):
         raise RuntimeError('run needs a Linux interactive terminal (SSH -t); cannot attach existing agents')
@@ -357,11 +359,19 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
                         raise
                     data = b''
                 if not data:
-                    # EOF also occurs when a live child closes all slave FDs.
-                    info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-                    return (status if status is not None else
-                            (info.si_status if info.si_code == os.CLD_EXITED
-                             else 128 + info.si_status) if info is not None else 0)
+                    # Slave closure can precede exit becoming waitable. Allow a
+                    # bounded grace period, but still reclaim a live EOF child.
+                    deadline = time.monotonic() + .2
+                    while status is None:
+                        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                        if info is not None:
+                            status = (info.si_status if info.si_code == os.CLD_EXITED
+                                      else 128 + info.si_status)
+                            break
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(.01)
+                    return status if status is not None else 0
                 write_all(1, data)
                 stream.feed(decoder.decode(data))
                 gate.output('\n'.join(screen.display), time.monotonic())
@@ -403,8 +413,8 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
                 os.close(master)
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='在当前 SSH 终端启动并监管自己的 StepCode PTY')
+def pty_main(argv=None):
+    parser = argparse.ArgumentParser(description='显式启动并监管自己的 StepCode PTY（run）')
     parser.add_argument('--cli', choices=['stepcode', 'stepgo'])
     parser.add_argument('arguments', nargs=argparse.REMAINDER, help='-- 后的参数原样传给交互 agent')
     args = parser.parse_args(argv)
@@ -416,6 +426,14 @@ def main(argv=None):
         print('step-watch: %s' % (str(exc) if isinstance(exc, RuntimeError)
                                  else type(exc).__name__), file=sys.stderr)
         return 2
+
+
+def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    if arguments[:1] == ['run']:
+        return pty_main(arguments[1:])
+    from step_watch_daemon import main as daemon_main
+    return daemon_main(arguments)
 
 
 if __name__ == '__main__':

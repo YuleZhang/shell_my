@@ -6,10 +6,10 @@ Shell 与设备工具合集。它包含 `adb-sync`、可替换 `adb` 前端、SI
 
 ## 安装
 
-日常安装直接使用现有的作者 pip server，无需克隆仓库，也无需在客户端启动服务：
+日常安装使用现有作者 pip server，无需克隆仓库或启动新的 agent 对话：
 
 ```bash
-python3 -m pip install --upgrade "yuutils==1.5.1" \
+python3 -m pip install --upgrade "yuutils==1.5.2" \
     --extra-index-url http://10.168.248.83:8080/simple/ \
     --trusted-host 10.168.248.83
 ```
@@ -25,17 +25,17 @@ run_siq_benchmark.py --self-test
 该服务仅用于受信的内部网络；不要在不可信网络中使用明文 HTTP 安装。由于服务是
 HTTP 索引，必须传入 `--trusted-host`。客户端需要能够访问 `10.168.248.83:8080`；
 无法访问时请联系作者确认当前网络地址。Python 运行时依赖为 `tabulate`（性能表格）
-和 `pyte>=0.8.2,<0.9`（PTY 屏幕解析），pip 自动安装。yuutils 1.5.1 要求 Python
+和 `pyte>=0.8.2,<0.9`（PTY 屏幕解析），pip 自动安装。yuutils 1.5.2 要求 Python
 3.8 或更高版本。正式发布产物提供 `SHA256SUMS`，从 GitHub 手动下载时应先核对校验和。
 
 GitHub Release 可作为备用下载入口：
 
-- <https://github.com/YuleZhang/shell_my/releases/tag/yuutils-v1.5.1>
+- <https://github.com/YuleZhang/shell_my/releases/tag/yuutils-v1.5.2>
 
 下载 wheel 后可以离线安装：
 
 ```bash
-python3 -m pip install ./yuutils-1.5.1-py3-none-any.whl
+python3 -m pip install ./yuutils-1.5.2-py3-none-any.whl
 ```
 
 ## SIQ benchmark 工具链
@@ -108,74 +108,86 @@ source "$(adb-sync-env)" off
 
 `adb-sync` 本身仍保持独立版本与测试；yuutils 版本表示本次工具集合快照的版本。
 
-## 会话恢复监控（1.5.1）
+## 会话恢复监控（1.5.2）
 
-一行安装并开启：
-
-```bash
-# Herdr 终端（当前缺少 UID 证据时仅启动监控，不发送输入）
-python3 -m pip install -U 'yuutils==1.5.1' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && stepcode-claude-watch.py start
-# 普通 SSH 交互终端
-python3 -m pip install -U 'yuutils==1.5.1' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && step-watch
-```
-
-SSH 需要 Linux `/proc`、交互 TTY（远程调用用 `ssh -t`），以及 PATH 中已安装、
-已配置的 `stepcode` 或 `stepgo`。只启动自己的新 PTY，不接管已运行的其他 agent：
+1.5.1 默认是前台新 PTY，**不是监控已有会话的后台服务**。1.5.2 默认改为当前 UID
+后台 daemon：打印 PID 和监控范围后返回 shell，不创建对话、不打开其他 TTY。
+已有未接入的会话需要按下面步骤加载桥接；未验证的版本和后端会显示原因，不会假报可自动回复。
 
 ```bash
-step-watch --cli stepgo -- --model <已配置模型>
-stepcode-claude-watch.py run --cli stepcode -- --model <已配置模型>
+python3 -m pip install -U 'yuutils==1.5.2' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && step-watch start
+step-watch status
+step-watch log
+step-watch stop
 ```
 
-显式 `--cli` 优先，否则先找 `stepcode` 再找 `stepgo`。仅显示程序名和启动入口，
-不打印参数。通过所选 CLI 的 `--help` 检测接口：StepGo（包括 `stepcode` 符号
-链接）使用 `<CLI> agent run stepcli <参数>`；独立旧版 StepCode 仅在识别到
-`Usage: stepcode [options]` 时直接启动；未知接口拒绝启动。`--` 后只传 agent
-参数，不重复写 `agent run stepcli`。429 使用同一所选 CLI 的 `usage`，当前用户
-正常凭据配置由 CLI 自己读取，不复制凭据、不切换账户。
+`stepcode-claude-watch.py start/status/log/stop` 同样委托给后台服务。
+启动会安装桥接到当前 `HOME`（去除首尾空白；未设置时回退 passwd home）下
+`.stepcode/agent/extensions/yuutils-step-watch` 和 `.stepgo/config/agent/extensions/yuutils-step-watch`。
+已有会话需要用户执行一次 **`/reload`**，后续新会话自动加载；daemon 不替用户输入该命令。
+自定义目录用 `step-watch start --agent-dir /absolute/agent/root`（可重复）；不会扫描配置或凭据。
+已有不同内容的扩展文件不会覆盖，需先人工审阅/移除旧桥接文件再安装，随后 `/reload`。
 
-只对当前可见屏幕中的明确重试耗尽过载或 429 `rate_limit_exceeded`，且光标在空白
-`Ask Step to do anything (/ for commands)` composer，连续 3 秒无输入/输出时发送
-一次 `continue`。429 还需至少一项可识别正余额；未知余额/查询失败跳过，60 秒后
-可重新查询。恢复冷却 60 秒，同一错误屏幕不重复提交。输入、粘贴、终端响应和窗口
-改变取消候选，未提交的用户输入不重新武装。草稿、审批、工具输出、错误历史或未知
-界面不注入。ANSI 刷新用 `pyte` 解析当前屏幕，不扫描历史字节。
+Linux `/proc`、Unix socket/SO_PEERCRED 和已安装的 native Step 扩展接口必需；后台服务
+只使用 Python 标准库，不要求交互 TTY、独立 Node 命令或 Herdr。桥接由 native 内置 JS
+运行时执行，使用 `node:fs/path/http/crypto`。`pyte` 仅供显式旧 PTY 模式；`tabulate` 供性能工具。
+拒绝 sudo、UID/EUID 不一致、跨登录用户、非私有目录、符号链接与不可信端点。
 
-Herdr 入口保留（查看日志需系统 `tail`）：
+### 已验证安全范围
 
-```bash
-stepcode-claude-watch.py start
-stepcode-claude-watch.py status
-stepcode-claude-watch.py log -n 30
-stepcode-claude-watch.py stop
-```
+- 原生 `agent_end` 的最后 assistant 必须是明确的服务器过载错误；`agent_settled` 后
+  空闲、无 pending、空编辑器、无图片占位草稿、无粘贴/输入、无模态/overlay/自动补全，
+  且静默 3 秒、恢复冷却 60 秒，才调用固定
+  `pi.sendUserMessage('continue', {deliverAs: 'followUp'})`。仅消费加载桥接后观察到的错误，
+  不扫描 transcript、旧日志或终端历史；已有历史失败不会自动引导恢复。
+- 通过原生 `ui.custom` 的立即关闭 overlay 工厂取得 TUI，只观察真实默认编辑器，
+  不另建或替换编辑器。对原生重载时相同文本的重复赋值做保留处理，避免丢失长粘贴展开数据；
+  退出时恢复自己的方法包装。每次 IPC 同步重新检查 focus、overlay 和编辑器属性。
+  原生本构建图片仅按文本中的 `[Image #n]` 解析；已删除占位的孤立注册项不发送。
+  输入取消候选并锁定到下一新回合，以覆盖异步剪贴板读取。
+- 仅验证过 SHA256 为
+  `da9218ed201419a93cd233adb203743657fe497fee15117e768d2c9438dd3ae5`
+  的 Linux native ELF。其他二进制、RPC、SDK、自定义 editor factory 或未知 UI
+  显示 `ui-safety-unavailable`，不允许通过用户“verified”标志绕过。
+- **429 `rate_limit_exceeded` 暂不自动恢复**：原生上下文未提供可可靠绑定所选 wrapper
+  CLI 的账号/凭据配置。不能拿另一 CLI 的 `usage` 正余额冒充同账号；返回
+  `balance-unverified`，即使外部声称余额验证成功也拒绝。
+- `submitted-unconfirmed` 只表示已经调用发送 API，不表示模型收到或完成；调用前消费候选，
+  发送抛错/超时/重复请求不重发，不绕过 agent 的审批。
 
-Herdr 每 5 秒扫描，保留 Claude 504 和 StepCode 恢复代码，但 **Herdr 0.9.3 当前
-agent/pane metadata 不提供可靠的服务与目标 UID 证据，恢复失败关闭，不发送按键
-或 continue**。自行报告的 UID/PID、pane 名称、可见性不是授权证据；需未来经过
-验证的所有权接口才可启用。状态位于系统用户数据库对应 home 下的
-`~/.local/state/stepcode-claude-watch/{watch.pid,watch.lock,watch.log}`；目录 0700、
-文件 0600，拒绝符号链接、跨 UID、非私有文件。新版本不读取旧平铺状态文件；升级
-前需使用旧版命令停止原 watcher。
+daemon 每秒发现当前 UID 的已有/未来 `stepcode/stepgo`（包括 Node `stepgo.js`）、native
+及通过同 UID `/proc` 祖先链关联的 native 子进程。`status` 区分 `connected`、
+`needs-extension-load`、`waiting-child`、`unsupported-backend`；连接不等于允许恢复。
+Herdr 本身缺少可靠目标所有权接口，不通过 pane API 注入；其中独立 native 会话只有建立
+可信桥接后才按上述规则恢复。`stop` 仅停止 daemon，不关闭任何 agent。
 
-限制与隔离：
+默认私有 runtime 为 `/tmp/yuutils-watch-<UID>`（目录 0700；socket/元数据/运维日志 0600）。
+可用 `YUUTILS_WATCH_RUNTIME` 指定同样私有的绝对短路径（最多 65 字节，daemon 与会话需一致）。
+鉴权 capability 仅存私有端点元数据，不打印；不记录模型输出、提示、错误正文、完整 cmdline
+或凭据。日志只含固定启动/停止信息；进程身份同时检查 PID/start-time、四个 UID 和 peer credentials。
 
-- 使用真实 UID/EUID 和 Linux loginuid，不用 `$USER` 授权；拒绝 sudo、UID/EUID
-  不一致或可识别的跨 UID 登录。无法验证用户/目标身份时不注入、不发信号。
-- SSH 只写自己持有的 PTY master；清理仅自己的 UID/start-time 匹配子进程组，不用
-  pkill、TIOCSTI 或其他 TTY。其他实例不受影响；脱离该组的后代不追杀。
-- 透传键盘、终端查询响应、窗口尺寸和退出码；退出/信号恢复终端并清理自己进程组。
-  SSH 断开即退出，不保证后台继续。它不是进程沙箱，不阻止 CLI 自身跨权限操作。
-- 启发式仅支持上述 StepCode 布局。窄窗口换行、未知 footer/光标、多行 composer、
-  频繁重绘可能安全地漏恢复；输入检查与写入之间仍存在不可消除的调度竞争。
-- 自动 continue 继续既有 agent 工作，仍受 agent 授权约束。SSH 不落盘屏幕或模型
-  输出；不要共享含敏感内容的 CLI 屏幕或 Herdr 日志。
+### 显式旧模式
 
-开发验证（假 CLI，不访问模型；临时目录安装，不构建发布 wheel/sdist）：
+仅需新前台 PTY 时：`step-watch run --cli stepgo -- --model <已配置模型>`。
+StepGo 入口由已验证 CLI help 识别为 `agent run stepcli`；未知 CLI 拒绝启动。
+该模式不是后台已有会话服务，依赖 `pyte`，SSH 断开会退出。
+旧 Herdr 监控用 `stepcode-claude-watch.py herdr start/status/log/stop`（运行需要 PATH 中的
+`herdr`、所选 CLI；跟踪日志需要 `tail`），缺少所有权证明仍不发按键。升级前先停止旧进程。
+
+### 开发验证（不访问模型）
 
 ```bash
 python3 -m unittest discover -s yuutils -p 'test_*.py' -v
+node yuutils/test_step_watch_bridge.mjs
+python3 yuutils/native_watch_smoke.py --native "$HOME/.stepcode/bin/step"
+python3 yuutils/native_watch_smoke.py --tui --native "$HOME/.stepcode/bin/step"
+python3 yuutils/validate_watch_package.py
 ```
+
+JS 检查需 PATH 中的 Node.js。原生测试仅启动新隔离 HOME/TUI；不读真实凭据，
+不向现有会话发输入。TUI 测试通过真实 Unix HTTP 服务及 Python SO_PEERCRED 客户端
+触发一次原生发送 API，在 native `input` 事件返回 `handled` **阻止模型调用**；
+分别验证文字、原生图片占位、未结束粘贴、模态、overlay 和 429 拒绝，不保存终端输出。
 
 ## 其他已安装内容
 

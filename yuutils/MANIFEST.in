@@ -14,3 +14,10 @@ include utils/stepcode-claude-watch.py
 include test_stepcode_claude_watch.py
 include step_watch.py
 include test_step_watch.py
+include step_watch_daemon.py
+recursive-include step_watch_assets *.py *.js
+include test_step_watch_daemon.py
+include test_step_watch_bridge.mjs
+include native_watch_smoke.py
+include native_watch_probe.mjs
+include validate_watch_package.py

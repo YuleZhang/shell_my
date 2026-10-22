@@ -52,8 +52,8 @@ class YuutilsReleaseTest(unittest.TestCase):
   def test_readme_uses_current_server_and_pinned_version(self):
     readme = (HERE / 'README.md').read_text(encoding='utf-8')
     self.assertIn('http://10.168.248.83:8080/simple/', readme)
-    self.assertIn('yuutils==1.5.1', readme)
-    self.assertIn('yuutils-v1.5.1', readme)
+    self.assertIn('yuutils==1.5.2', readme)
+    self.assertIn('yuutils-v1.5.2', readme)
     self.assertIn('step-watch', readme)
     self.assertIn('agent run stepcli', readme)
 

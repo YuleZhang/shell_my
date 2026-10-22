@@ -27,6 +27,12 @@ class WatchTests(unittest.TestCase):
         self.ownership.start()
         self.addCleanup(self.ownership.stop)
 
+    def test_default_entrypoint_delegates_to_uid_daemon(self):
+        with patch.object(w.sys, 'argv', ['stepcode-claude-watch.py', 'start']), \
+                patch.object(w.step_watch, 'main', return_value=0) as delegated:
+            self.assertEqual(w.main(), 0)
+            delegated.assert_called_once_with(['start'])
+
     def test_unknown_ownership_never_sends(self):
         with patch.object(w, 'owned_agent', return_value=False), patch.object(w.subprocess, 'run') as run:
             self.assertFalse(w.recover_overload(AGENT, SCREEN, {}))

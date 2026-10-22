@@ -48,8 +48,11 @@ prompt = os.environ['PROMPT']
 if mode == 'burst_exit':
     os.write(1, b'Z' * 8000 + b'FINAL_MARKER')
     sys.exit(7)
-if mode == 'live_eof':
+if mode in ('live_eof', 'eof_before_exit'):
     for fd in (0, 1, 2): os.close(fd)
+    if mode == 'eof_before_exit':
+        time.sleep(.05)
+        sys.exit(7)
     time.sleep(30)
 if mode in ('rate', 'rate_query'):
     error = 'Error: Retry failed after 3 attempts: OpenAI API error (429): {"message":"Rate limit exceeded", "code":"rate_limit_exceeded"}'
@@ -242,7 +245,7 @@ class PtyTests(unittest.TestCase):
                        "sys.exit(step_watch.run(sys.argv[1], sys.argv[2:], quiet=.25, cooldown=.3))"]
         env = dict(self.env, MODE=mode, BALANCE=balance)
         argv = program + ([cli, '--model', 'fake'] if direct else
-                          ['--cli', cli, '--', '--model', 'fake'])
+                          ['run', '--cli', cli, '--', '--model', 'fake'])
         proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
                                 env=env, cwd=HERE if direct else self.root)
         self.addCleanup(self.close_process, proc, master, slave)
@@ -389,6 +392,9 @@ class PtyTests(unittest.TestCase):
     def test_real_pty_exit_drains_all_output(self):
         self.assertEqual(self.finish(self.spawn(mode='burst_exit')), 7)
         self.assertTrue(self.output.endswith(b'Z' * 8000 + b'FINAL_MARKER'))
+
+    def test_real_pty_eof_before_exit_preserves_status(self):
+        self.assertEqual(self.finish(self.spawn(mode='eof_before_exit')), 7)
 
     def test_real_pty_live_eof_reclaims_child_and_restores_terminal(self):
         started = time.monotonic()

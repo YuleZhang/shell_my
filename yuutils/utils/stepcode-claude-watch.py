@@ -344,8 +344,10 @@ def watch(threshold, interval):
 
 
 def main():
-    if sys.argv[1:2] == ['run']:
-        return step_watch.main(sys.argv[2:])
+    if sys.argv[1:2] != ['herdr'] and '--_watch' not in sys.argv[1:]:
+        return step_watch.main(sys.argv[1:])
+    if sys.argv[1:2] == ['herdr']:
+        del sys.argv[1]
     step_watch.current_uid()
     if len(sys.argv) == 1:
         sys.argv.append("start")
