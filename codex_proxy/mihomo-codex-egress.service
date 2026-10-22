@@ -1,0 +1,12 @@
+[Unit]
+Description=Mihomo Codex domain routing proxy
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/mihomo -d %h/.config/mihomo -f %h/.config/mihomo/codex-egress.yaml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

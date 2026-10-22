@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex app-server updater with routed proxy
+Requires=mihomo-codex-egress.service
+After=mihomo-codex-egress.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+EnvironmentFile=%h/.config/codex-proxy/environment
+ExecStart=%h/.codex/packages/app-server-daemon/current/bin/codex app-server daemon pid-update-loop
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
