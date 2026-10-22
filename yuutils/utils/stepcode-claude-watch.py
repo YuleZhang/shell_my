@@ -263,9 +263,10 @@ def show_log(lines, follow):
     command = ["tail", "-n", str(lines)]
     if follow:
         command.append("-f")
-    command.append(str(LOG_FILE))
     with os.fdopen(step_watch.private_open(LOG_FILE, os.O_RDONLY)) as handle:
-        subprocess.run(command[:-1], stdin=handle, check=False)
+        # Follow the independently verified inode, not stdin or a re-opened path.
+        command.append(f"/proc/self/fd/{handle.fileno()}")
+        subprocess.run(command, pass_fds=(handle.fileno(),), check=False)
 
 
 def watch(threshold, interval):

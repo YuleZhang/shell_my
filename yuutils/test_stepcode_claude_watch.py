@@ -1,5 +1,11 @@
 import importlib.util
+import os
+import select
+import signal
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -38,6 +44,49 @@ class WatchTests(unittest.TestCase):
             self.assertFalse(w.recover_overload(AGENT, SCREEN, {}))
             self.assertFalse(w.recover(AGENT, '504'))
             run.assert_not_called()
+
+    def test_follow_appends_to_verified_inode_after_path_replacement(self):
+        with tempfile.TemporaryDirectory(prefix='watch-follow-') as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            logfile = root / 'watch.log'
+            logfile.write_text('initial\n')
+            logfile.chmod(0o600)
+            code = (
+                "import importlib.util,sys; from pathlib import Path; "
+                f"sys.path.insert(0, {str(SCRIPT.parent.parent)!r}); "
+                f"s=importlib.util.spec_from_file_location('watcher', {str(SCRIPT)!r}); "
+                "w=importlib.util.module_from_spec(s); s.loader.exec_module(w); "
+                f"w.LOG_FILE=Path({str(logfile)!r}); w.show_log(1, True)"
+            )
+            process = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True)
+            received = b''
+
+            def wait_for(expected):
+                nonlocal received
+                deadline = time.monotonic() + 8
+                while expected not in received and time.monotonic() < deadline:
+                    if select.select([process.stdout], [], [], .2)[0]:
+                        chunk = os.read(process.stdout.fileno(), 4096)
+                        if not chunk:
+                            break
+                        received += chunk
+                self.assertIn(expected, received)
+
+            try:
+                wait_for(b'initial\n')
+                original = root / 'original.log'
+                logfile.rename(original)
+                logfile.write_text('replacement\n')
+                logfile.chmod(0o600)
+                with original.open('a') as handle:
+                    handle.write('appended-to-original\n')
+                wait_for(b'appended-to-original\n')
+                self.assertNotIn(b'replacement', received)
+            finally:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=5)
 
     def test_user_sample(self):
         self.assertEqual(w.terminal_failure(SCREEN), 'overload')

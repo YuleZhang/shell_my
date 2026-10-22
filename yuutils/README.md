@@ -174,6 +174,13 @@ StepGo 入口由已验证 CLI help 识别为 `agent run stepcli`；未知 CLI �
 旧 Herdr 监控用 `stepcode-claude-watch.py herdr start/status/log/stop`（运行需要 PATH 中的
 `herdr`、所选 CLI；跟踪日志需要 `tail`），缺少所有权证明仍不发按键。升级前先停止旧进程。
 
+**破坏性变更：**与早期 Herdr watcher 相比，旧模式不再自动输入或恢复 Claude/StepCode，
+因为当前 Herdr 无可靠目标 UID 证据。这不是“保持旧自动恢复行为不变”。需要自动恢复时，
+使用上面的原生后台桥接，并遵守已验证版本、接入和错误类型限制。
+
+实时查看旧模式日志：`stepcode-claude-watch.py herdr log --follow`。
+跟踪安全验证并打开的文件描述符；日志路径被替换后仍跟踪原文件，不自动打开替换文件。
+
 ### 开发验证（不访问模型）
 
 ```bash
