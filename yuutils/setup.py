@@ -12,7 +12,7 @@ HERE = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, HERE)
 import yuutils_manifest  # noqa: E402
 
-VERSION = '1.5.2'
+VERSION = '1.5.3'
 SUPPORT_DIR = 'yuutils-support'
 
 

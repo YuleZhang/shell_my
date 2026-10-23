@@ -1,4 +1,4 @@
-// yuutils native bridge v1.5.2. No transcripts, prompts or credentials on disk.
+// yuutils native bridge v1.5.3. No transcripts, prompts or credentials on disk.
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
@@ -29,9 +29,15 @@ export class RecoveryGate {
     const last = [...(event.messages || [])].reverse().find(m => m.role === 'assistant');
     if (!last || last.stopReason !== 'error' || typeof last.errorMessage !== 'string') return;
     // Only the last native error, never transcript/terminal/history matching.
-    if (/Our servers are currently overloaded\.\s*Please try again later\./i.test(last.errorMessage)) {
+    // Explicit Key exhaustion wins over any transient text in the same error.
+    if (/OpenAI\s+API\s+error\s*\(402\)/i.test(last.errorMessage) &&
+        (/API\s+Key\s+quota\s+has\s+been\s+exhausted\b/i.test(last.errorMessage) ||
+         /\bapi_key_quota_exhausted\b/i.test(last.errorMessage))) {
+      this.candidate = 'quota-exhausted';
+    } else if (/Our\s+servers\s+are\s+currently\s+overloaded\.\s*Please\s+try\s+again\s+later\./i.test(last.errorMessage)) {
       this.candidate = 'overload';
-    } else if (/\brate_limit_exceeded\b/.test(last.errorMessage)) {
+    } else if (/\brate_limit_exceeded\b/.test(last.errorMessage) ||
+               /OpenAI\s+API\s+error\s*\(429\):[\s\S]*Rate\s+limit\s+exceeded\b/i.test(last.errorMessage)) {
       this.candidate = 'rate-limit';
     }
   }
@@ -43,6 +49,7 @@ export class RecoveryGate {
     const denied = recovery => ({ recovery, eligible: false });
     // Native getEditorText() cannot prove absence of image-only drafts, host
     // overlays, custom editor state or pending terminal input. No opt-in bypass.
+    if (this.candidate === 'quota-exhausted') return denied('quota-exhausted');
     if (!safety || safety.verified !== true) return denied('ui-safety-unavailable');
     if (!this.candidate) return denied('no-candidate');
     if (!this.settled) return denied('not-settled');
@@ -54,9 +61,6 @@ export class RecoveryGate {
       if (safety.images !== false || safety.draft !== false) return denied('draft');
       if (safety.input !== false) return denied('input');
       if (this.clock() - this.changed < 3000) return denied('quiet');
-      // Native UI does not expose the credential/profile used by the selected
-      // wrapper CLI; running another CLI's usage would not prove same account.
-      if (this.candidate === 'rate-limit') return denied('balance-unverified');
       if (this.clock() - this.lastAttempt < 60000) return denied('cooldown');
       return { recovery: 'eligible', eligible: true };
     } catch { return denied('unknown'); }

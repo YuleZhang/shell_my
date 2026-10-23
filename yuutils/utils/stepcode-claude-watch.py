@@ -106,7 +106,7 @@ def recover_overload(agent, output, recovered, balance_checked=None):
     if not owned_agent(agent):
         return False
     reason = terminal_failure(output)
-    if agent.get("agent_status") not in ("idle", "done") or not reason:
+    if agent.get("agent_status") not in ("idle", "done") or reason not in ("overload", "rate limit"):
         return False
     identity = agent_identity(agent)
     event = (agent.get("state_change_seq"), agent.get("completion_seq"))
@@ -114,14 +114,6 @@ def recover_overload(agent, output, recovered, balance_checked=None):
     now = time.monotonic()
     if previous and (previous[0] == event or now - previous[1] < OVERLOAD_COOLDOWN):
         return False
-    if reason == "rate limit":
-        balance_checked = balance_checked if balance_checked is not None else {}
-        checked_at = balance_checked.get(identity)
-        if checked_at is not None and now - checked_at < OVERLOAD_COOLDOWN:
-            return False
-        if not has_stepcode_balance():
-            balance_checked[identity] = now
-            return False
     # Recheck both identity and output before injecting input into a live pane.
     current = agents_by_pane().get(agent["pane_id"])
     if (not current or not owned_agent(current) or agent_identity(current) != identity

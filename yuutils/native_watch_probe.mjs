@@ -4,6 +4,10 @@ import bridge, { NativeUISafety } from './bridge.js';
 export default function probe(pi) {
   fs.writeFileSync(process.env.YW_RECEIPT, JSON.stringify({ phase: 'loaded', sends: 0 }), { mode: 0o600 });
   const handlers = new Map();
+  // Synthetic text deliberately includes literal newlines and a malformed JSON code.
+  const rateError = 'Error: Retry failed after 3 attempts: OpenAI API error (429): {"message":"Rate limit exceeded\n [trace_id=synthetic\n code=20011]","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}';
+  const quotaError = 'Error: OpenAI API error (402): {"message":"API Key quota has been exhausted. | Used 2001 of\n 2000 in the current cycle.","type":"insufficient_quota","code":api_key_quota_exhausted"}';
+  const overloadError = 'Our servers are currently overloaded. Please try again later.';
   let ctx, tui, editor, sends = 0, dispatched = 0, finishModal;
   pi.on('input', (event) => {
     if (event.source !== 'extension') return { action:
@@ -144,6 +148,11 @@ export default function probe(pi) {
     if (arg === 'invoke-reload') { pi.sendUserMessage('/yw-reload', { expandPromptTemplates: true }); return; }
     if (arg === 'invoke-exit') { pi.sendUserMessage('/yw-exit', { expandPromptTemplates: true }); return; }
     if (arg === 'prepare-exit') { ctx.ui.setEditorText(''); receipt(arg); return; }
+    if (arg === 'rate-settled') {
+      handlers.get('agent_settled')({}, ctx);
+      receipt(arg);
+      return;
+    }
     if (arg === 'text') ctx.ui.setEditorText('synthetic draft');
     else if (arg === 'image') {
       ctx.ui.setEditorText('');
@@ -172,11 +181,16 @@ export default function probe(pi) {
       if (editor.isInPaste) editor.handleInput('\x1b[201~');
       ctx.ui.setEditorText('');
     }
-    handlers.get('agent_start')?.({}, ctx);
-    handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'error',
-      errorMessage: arg === 'rate' ? 'rate_limit_exceeded' :
-        'Our servers are currently overloaded. Please try again later.' }] }, ctx);
-    handlers.get('agent_settled')({}, ctx);
+    handlers.get('agent_start')({}, ctx);
+    const errorMessage = arg.startsWith('rate') ? rateError :
+      arg === 'quota-mixed' ? quotaError + '\nrate_limit_exceeded\n' + overloadError :
+      arg === 'quota' ? quotaError : overloadError;
+    const failed = { role: 'assistant', stopReason: 'error', errorMessage };
+    const messages = arg === 'success' ? [{ ...failed, stopReason: 'stop' }] :
+      arg === 'aborted' ? [{ ...failed, stopReason: 'aborted' }] :
+      arg === 'old-error' ? [failed, { role: 'assistant', stopReason: 'stop' }] : [failed];
+    handlers.get('agent_end')({ messages }, ctx);
+    if (arg !== 'rate-unsettled') handlers.get('agent_settled')({}, ctx);
     receipt(arg);
   };
 }
