@@ -1,0 +1,19 @@
+[Unit]
+Description=Personal engineering shortcuts (MR, accounts, reports, services)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/github/shell_my/engineering-home
+Environment=EH_CONFIG_FILE=%h/.config/engineering-home/config.json
+# Add the directory of your Node 24+ installation to PATH via a user drop-in.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node node_modules/tsx/dist/cli.mjs server/index.ts
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=190
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

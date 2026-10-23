@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -13,6 +14,13 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import step_watch
+except ModuleNotFoundError:
+    # Source checkout only; installed scripts use the packaged module.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import step_watch
 
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 RETRY = re.compile(r"retrying.{0,180}?attempt\s+(\d+)\s*/\s*(\d+)", re.I | re.S)
@@ -32,10 +40,10 @@ RATE_LIMIT_RETRY_FAILED = re.compile(
 REMAINING = re.compile(r"Remaining\s*¥\s*([\d,]+(?:\.\d+)?)", re.I)
 OVERLOAD_COOLDOWN = 60
 NOT_SEEN = object()
-STATE_DIR = Path.home() / ".local/state"
-LOCK_FILE = STATE_DIR / "stepcode-claude-watch.lock"
-PID_FILE = STATE_DIR / "stepcode-claude-watch.pid"
-LOG_FILE = STATE_DIR / "stepcode-claude-watch.log"
+STATE_DIR = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local/state/stepcode-claude-watch'
+LOCK_FILE = STATE_DIR / "watch.lock"
+PID_FILE = STATE_DIR / "watch.pid"
+LOG_FILE = STATE_DIR / "watch.log"
 
 
 def log(message):
@@ -48,6 +56,14 @@ def herdr_json(*args, timeout=15):
         raise RuntimeError(f"herdr {args[0]} failed (exit {result.returncode})")
     data = json.loads(result.stdout)
     return data.get("result", data)
+
+
+def owned_agent(agent):
+    step_watch.current_uid()
+    # Herdr 0.9.3 agent/list and pane/list expose no kernel UID or authenticated
+    # server/pane process identity. Display metadata is not ownership evidence.
+    # Do not accept user-reportable uid/pid fields as a future API contract.
+    return False
 
 
 def agents_by_pane():
@@ -74,43 +90,11 @@ def current_504(text):
 
 
 def terminal_failure(text):
-    text = clean(text)
-    matches = [(match, reason) for pattern, reason in (
-        (OVERLOAD_RETRY_FAILED, "overload"),
-        (RATE_LIMIT_RETRY_FAILED, "rate limit"),
-    ) for match in pattern.finditer(text)]
-    if not matches:
-        return None
-    # Only recover a terminal error followed by an empty composer, not history.
-    match, reason = max(matches, key=lambda item: item[0].start())
-    tail = text[match.end():]
-    prompt = re.search(r"^[❯›>]\s+Ask Step to do anything[^\n]*$", tail, re.M)
-    if not prompt:
-        return None
-    for line in tail[:prompt.start()].splitlines():
-        line = line.strip()
-        if not line or re.fullmatch(r"[─━\-]+", line):
-            continue
-        if line in ("Warning: Autopilot stopped because the same error repeated",
-                    "Warning: Autopilot stopped after reaching its retry limit"):
-            continue
-        return None
-    return reason
+    return step_watch.terminal_failure(text)
 
 
 def has_stepcode_balance():
-    try:
-        result = subprocess.run(["stepcode", "usage"], capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError) as exc:
-        log(f"stepcode usage failed: {type(exc).__name__}")
-        return False
-    if result.returncode:
-        log(f"stepcode usage failed: exit {result.returncode}")
-        return False
-    amounts = REMAINING.findall(clean(result.stdout))
-    if not amounts:
-        log("stepcode usage returned no recognizable remaining balance")
-    return any(float(amount.replace(",", "")) > 0 for amount in amounts)
+    return step_watch.has_balance(step_watch.choose_cli())
 
 
 def agent_identity(agent):
@@ -119,6 +103,8 @@ def agent_identity(agent):
 
 
 def recover_overload(agent, output, recovered, balance_checked=None):
+    if not owned_agent(agent):
+        return False
     reason = terminal_failure(output)
     if agent.get("agent_status") not in ("idle", "done") or not reason:
         return False
@@ -138,7 +124,7 @@ def recover_overload(agent, output, recovered, balance_checked=None):
             return False
     # Recheck both identity and output before injecting input into a live pane.
     current = agents_by_pane().get(agent["pane_id"])
-    if (not current or agent_identity(current) != identity
+    if (not current or not owned_agent(current) or agent_identity(current) != identity
             or current.get("agent_status") not in ("idle", "done")
             or (current.get("state_change_seq"), current.get("completion_seq")) != event):
         return False
@@ -164,6 +150,8 @@ def herdr_read(pane, lines=24):
 
 
 def recover(agent, reason):
+    if not owned_agent(agent):
+        return False
     pane = agent["pane_id"]
     session = (agent.get("agent_session") or {}).get("value")
     current = agents_by_pane().get(pane)
@@ -186,8 +174,12 @@ def recover(agent, reason):
 
 
 def running_pid():
+    step_watch.current_uid()
     try:
-        pid = int(PID_FILE.read_text().strip())
+        with os.fdopen(step_watch.private_open(PID_FILE, os.O_RDONLY)) as handle:
+            pid = int(handle.read().strip())
+        if step_watch.process_identity(pid, os.getuid()) is None:
+            return None
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         if (len(command) > 2 and Path(os.fsdecode(command[1])).name == Path(__file__).name
                 and b"--_watch" in command):
@@ -198,9 +190,10 @@ def running_pid():
 
 
 def check_dependencies():
-    for command in ("herdr", "stepcode"):
-        if not shutil.which(command):
-            raise RuntimeError(f"{command} is required on PATH")
+    step_watch.current_uid()
+    if not shutil.which('herdr'):
+        raise RuntimeError('herdr is required on PATH')
+    step_watch.choose_cli()
 
 
 def start(threshold, interval):
@@ -213,10 +206,9 @@ def start(threshold, interval):
         print(f"监控已运行 (PID {running_pid()})")
         return
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = os.fdopen(os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a")
+    step_watch.private_directory(STATE_DIR)
+    log_file = os.fdopen(step_watch.private_open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND), 'a')
     try:
-        os.chmod(LOG_FILE, 0o600)
         process = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--_watch", "--threshold", str(threshold), "--interval", str(interval)],
             stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT,
@@ -240,6 +232,9 @@ def stop():
     if not pid:
         print("监控未运行")
         return
+    identity = step_watch.process_identity(pid, os.getuid())
+    if identity is None or running_pid() != pid or step_watch.process_identity(pid, os.getuid()) != identity:
+        raise RuntimeError('watcher identity changed; refusing to signal')
     os.kill(pid, signal.SIGTERM)
     for _ in range(50):
         if not running_pid():
@@ -257,6 +252,7 @@ def show_status():
 
 
 def show_log(lines, follow):
+    step_watch.current_uid()
     if lines < 1:
         raise ValueError("lines 必须为正数")
     if not shutil.which("tail"):
@@ -267,8 +263,10 @@ def show_log(lines, follow):
     command = ["tail", "-n", str(lines)]
     if follow:
         command.append("-f")
-    command.append(str(LOG_FILE))
-    subprocess.run(command, check=False)
+    with os.fdopen(step_watch.private_open(LOG_FILE, os.O_RDONLY)) as handle:
+        # Follow the independently verified inode, not stdin or a re-opened path.
+        command.append(f"/proc/self/fd/{handle.fileno()}")
+        subprocess.run(command, pass_fds=(handle.fileno(),), check=False)
 
 
 def watch(threshold, interval):
@@ -278,13 +276,15 @@ def watch(threshold, interval):
         raise RuntimeError("HERDR_ENV=1 is required")
     check_dependencies()
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock = LOCK_FILE.open("a")
+    step_watch.private_directory(STATE_DIR)
+    lock = os.fdopen(step_watch.private_open(LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND), 'a')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise RuntimeError("another stepcode-claude-watch process is already running") from None
-    PID_FILE.write_text(f"{os.getpid()}\n")
+    with os.fdopen(step_watch.private_open(PID_FILE, os.O_WRONLY | os.O_CREAT), 'w') as handle:
+        handle.truncate(0)
+        handle.write(f'{os.getpid()}\n')
 
     def stop_signal(_signum, _frame):
         raise KeyboardInterrupt
@@ -296,12 +296,14 @@ def watch(threshold, interval):
     overload_recovered = {}
     balance_checked = {}
     first_scan = True
-    log(f"watching Claude/StepCode panes; retry threshold={threshold}, interval={interval}s")
+    log('Herdr ownership evidence unavailable: recovery is disabled (fail closed)')
     try:
         while True:
             try:
                 agents = agents_by_pane()
                 for agent in agents.values():
+                    if not owned_agent(agent):
+                        continue
                     kind = agent.get("agent")
                     session = (agent.get("agent_session") or {}).get("value")
                     if kind != "stepcode" and (kind != "claude" or not session):
@@ -330,9 +332,9 @@ def watch(threshold, interval):
                         elif error and previous_error != error and not first_scan:
                             recover(agent, f"504 trace_id={error}")
                     except (subprocess.SubprocessError, OSError, RuntimeError) as exc:
-                        log(f"read {pane} failed: {exc}")
+                        log(f'Herdr read failed: {type(exc).__name__}')
             except (subprocess.SubprocessError, OSError, RuntimeError, json.JSONDecodeError) as exc:
-                log(f"Herdr poll failed: {exc}")
+                log(f'Herdr poll failed: {type(exc).__name__}')
             first_scan = False
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -343,6 +345,11 @@ def watch(threshold, interval):
 
 
 def main():
+    if sys.argv[1:2] != ['herdr'] and '--_watch' not in sys.argv[1:]:
+        return step_watch.main(sys.argv[1:])
+    if sys.argv[1:2] == ['herdr']:
+        del sys.argv[1]
+    step_watch.current_uid()
     if len(sys.argv) == 1:
         sys.argv.append("start")
     parser = argparse.ArgumentParser(description="管理 Claude 504 / StepCode 过载及限流自动恢复监控")
@@ -377,4 +384,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

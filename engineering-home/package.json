@@ -1,0 +1,46 @@
+{
+  "name": "engineering-home",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:server": "tsx watch server/index.ts",
+    "start": "tsx server/index.ts",
+    "test": "tsx --test tests/*.test.ts web/tests/*.test.ts",
+    "test:browser": "python3 web/tests/browser_check.py",
+    "typecheck:backend": "tsc -p tsconfig.server.json --noEmit",
+    "typecheck:web": "tsc -p tsconfig.web.json --noEmit",
+    "typecheck": "npm run typecheck:backend && npm run typecheck:web",
+    "lint": "eslint server shared scripts tests web/src web/tests --max-warnings 0",
+    "build": "npm run typecheck && vite build",
+    "config:init": "tsx scripts/init-config.ts",
+    "password:hash": "tsx scripts/hash-password.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^8.3.0",
+    "fastify": "^5.6.2",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^10.13.0",
+    "tailwindcss": "^4.1.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vite": "^7.1.0"
+  }
+}

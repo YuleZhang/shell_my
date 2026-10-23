@@ -12,7 +12,7 @@ HERE = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, HERE)
 import yuutils_manifest  # noqa: E402
 
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 SUPPORT_DIR = 'yuutils-support'
 
 
@@ -44,15 +44,17 @@ setup(
     long_description_content_type='text/markdown',
     license='Apache-2.0',
     python_requires='>=3.8',
-    # process_sdk_log.py builds its performance table with tabulate; the other
-    # scripts in the bundle are standard library only.
-    install_requires=['tabulate'],
+    # Terminal screens use pyte; performance tables use tabulate.
+    install_requires=['tabulate', 'pyte>=0.8.2,<0.9'],
     cmdclass={'sdist': YuutilsSdist},
-    py_modules=['adb_sync_env_cli', 'yuutils_cli', 'yuutils_manifest'],
+    py_modules=['adb_sync_env_cli', 'yuutils_cli', 'yuutils_manifest', 'step_watch', 'step_watch_daemon'],
+    packages=['step_watch_assets'],
+    package_data={'step_watch_assets': ['index.js']},
     scripts=yuutils_manifest.ScriptPaths(),
     entry_points={
         'console_scripts': [
             'adb-sync-env = adb_sync_env_cli:main',
+            'step-watch = step_watch:main',
             'yuutils = yuutils_cli:main',
         ],
     },
