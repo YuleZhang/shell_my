@@ -9,7 +9,7 @@ Shell 与设备工具合集。它包含 `adb-sync`、可替换 `adb` 前端、SI
 日常安装使用现有作者 pip server，无需克隆仓库或启动新的 agent 对话：
 
 ```bash
-python3 -m pip install --upgrade "yuutils==1.5.2" \
+python3 -m pip install --upgrade "yuutils==1.5.3" \
     --extra-index-url http://10.168.248.83:8080/simple/ \
     --trusted-host 10.168.248.83
 ```
@@ -25,17 +25,17 @@ run_siq_benchmark.py --self-test
 该服务仅用于受信的内部网络；不要在不可信网络中使用明文 HTTP 安装。由于服务是
 HTTP 索引，必须传入 `--trusted-host`。客户端需要能够访问 `10.168.248.83:8080`；
 无法访问时请联系作者确认当前网络地址。Python 运行时依赖为 `tabulate`（性能表格）
-和 `pyte>=0.8.2,<0.9`（PTY 屏幕解析），pip 自动安装。yuutils 1.5.2 要求 Python
+和 `pyte>=0.8.2,<0.9`（PTY 屏幕解析），pip 自动安装。yuutils 1.5.3 要求 Python
 3.8 或更高版本。正式发布产物提供 `SHA256SUMS`，从 GitHub 手动下载时应先核对校验和。
 
 GitHub Release 可作为备用下载入口：
 
-- <https://github.com/YuleZhang/shell_my/releases/tag/yuutils-v1.5.2>
+- <https://github.com/YuleZhang/shell_my/releases/tag/yuutils-v1.5.3>
 
 下载 wheel 后可以离线安装：
 
 ```bash
-python3 -m pip install ./yuutils-1.5.2-py3-none-any.whl
+python3 -m pip install ./yuutils-1.5.3-py3-none-any.whl
 ```
 
 ## SIQ benchmark 工具链
@@ -108,14 +108,15 @@ source "$(adb-sync-env)" off
 
 `adb-sync` 本身仍保持独立版本与测试；yuutils 版本表示本次工具集合快照的版本。
 
-## 会话恢复监控（1.5.2）
+## 会话恢复监控（1.5.3）
 
 1.5.1 默认是前台新 PTY，**不是监控已有会话的后台服务**。1.5.2 默认改为当前 UID
 后台 daemon：打印 PID 和监控范围后返回 shell，不创建对话、不打开其他 TTY。
+1.5.3 修复 429 自动继续、402 Key 配额禁止和启动诊断，保留已有安全检查。
 已有未接入的会话需要按下面步骤加载桥接；未验证的版本和后端会显示原因，不会假报可自动回复。
 
 ```bash
-python3 -m pip install -U 'yuutils==1.5.2' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && step-watch start
+python3 -m pip install -U 'yuutils==1.5.3' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && step-watch start
 step-watch status
 step-watch log
 step-watch stop
@@ -135,7 +136,7 @@ Linux `/proc`、Unix socket/SO_PEERCRED 和已安装的 native Step 扩展接口
 
 ### 已验证安全范围
 
-- 原生 `agent_end` 的最后 assistant 必须是明确的服务器过载错误；`agent_settled` 后
+- 原生 `agent_end` 的最后 assistant 必须是明确的服务器过载或暂时限流错误；`agent_settled` 后
   空闲、无 pending、空编辑器、无图片占位草稿、无粘贴/输入、无模态/overlay/自动补全，
   且静默 3 秒、恢复冷却 60 秒，才调用固定
   `pi.sendUserMessage('continue', {deliverAs: 'followUp'})`。仅消费加载桥接后观察到的错误，
@@ -149,9 +150,15 @@ Linux `/proc`、Unix socket/SO_PEERCRED 和已安装的 native Step 扩展接口
   `da9218ed201419a93cd233adb203743657fe497fee15117e768d2c9438dd3ae5`
   的 Linux native ELF。其他二进制、RPC、SDK、自定义 editor factory 或未知 UI
   显示 `ui-safety-unavailable`，不允许通过用户“verified”标志绕过。
-- **429 `rate_limit_exceeded` 暂不自动恢复**：原生上下文未提供可可靠绑定所选 wrapper
-  CLI 的账号/凭据配置。不能拿另一 CLI 的 `usage` 正余额冒充同账号；返回
-  `balance-unverified`，即使外部声称余额验证成功也拒绝。
+- **429 自动恢复**：识别 `rate_limit_exceeded` 和换行的 `OpenAI API error (429)` /
+  `Rate limit exceeded`；内置 retry / autopilot 耗尽且原生回合 settled 后，按上述安全规则
+  自动发送 `continue`。不再用 wrapper CLI 的 `usage` 余额作为恢复门槛，也不访问凭据。
+  每个新失败回合均可恢复，包括相同的 429，但距离上次提交至少 60 秒；同一候选不重复发送。
+- **402 Key 配额耗尽禁止恢复**：同一错误中 HTTP 402 且包含
+  `API Key quota has been exhausted` 或 `api_key_quota_exhausted`，返回 `quota-exhausted`；
+  即使混有过载/限流文本，也绝不发送 `continue`。兼容换行与错误示例中的非标准 JSON。
+  其他未知错误没有恢复候选；这不是把所有 402 都视为 Key 配额耗尽。
+  此限制控制 watcher 的自动继续，不修改 StepCode 内部已开始的 provider / autopilot 重试。
 - `submitted-unconfirmed` 只表示已经调用发送 API，不表示模型收到或完成；调用前消费候选，
   发送抛错/超时/重复请求不重发，不绕过 agent 的审批。
 
@@ -164,13 +171,27 @@ Herdr 本身缺少可靠目标所有权接口，不通过 pane API 注入；其�
 默认私有 runtime 为 `/tmp/yuutils-watch-<UID>`（目录 0700；socket/元数据/运维日志 0600）。
 可用 `YUUTILS_WATCH_RUNTIME` 指定同样私有的绝对短路径（最多 65 字节，daemon 与会话需一致）。
 鉴权 capability 仅存私有端点元数据，不打印；不记录模型输出、提示、错误正文、完整 cmdline
-或凭据。日志只含固定启动/停止信息；进程身份同时检查 PID/start-time、四个 UID 和 peer credentials。
+或凭据。日志记录固定策略、首次扫描及后续状态变化，进程身份同时检查 PID/start-time、
+四个 UID 和 peer credentials。
+
+`start` 首次扫描尚未完成时明确显示 `scan=discovering`，不将其假报为没有会话。
+扫描完成后 `status` / `log` 显示 `connected` / `unbridged` 数量和 `PID/state/recovery`。
+日志中的 `quota-exhausted` 是 Key 配额禁止，`cooldown` 是等待 60 秒，`submitted-unconfirmed`
+表示已调用恢复 API；`needs-extension-load` 提示加载桥接，`ui-safety-unavailable` 表示当前
+原生版本或编辑器未通过验证。仅记录状态变化，避免每秒重复刷屏；退出进程也会记录。
+启动失败会给出 `extension-conflict`、`private-directory`、`readiness-timeout` 等固定原因和
+处理提示，而不会回显任意异常。旧扩展内容冲突仍不自动覆盖：先人工审阅旧文件，确认替换后
+再安装 1.5.3，运行 `step-watch start` 并在已有会话中 `/reload`；新会话自动加载新桥接。
 
 ### 显式旧模式
 
 仅需新前台 PTY 时：`step-watch run --cli stepgo -- --model <已配置模型>`。
 StepGo 入口由已验证 CLI help 识别为 `agent run stepcli`；未知 CLI 拒绝启动。
-该模式不是后台已有会话服务，依赖 `pyte`，SSH 断开会退出。
+该模式不是后台已有会话服务，依赖 `pyte`，SSH 断开会退出。启动显示 UID、恢复策略、
+静默与冷却参数；429 包含普通错误和 retry 耗尽的换行格式，不查询余额。PTY 记录真实软折行
+边界，支持 60/80/100 列的关键词折行；空输入区的局部清行不会丢掉未改动错误的折行信息。
+402 Key 配额耗尽
+只输出固定禁止原因，不发送继续；编辑器/输入保护和稳定非失败窗口再武装仍保持保守。
 旧 Herdr 监控用 `stepcode-claude-watch.py herdr start/status/log/stop`（运行需要 PATH 中的
 `herdr`、所选 CLI；跟踪日志需要 `tail`），缺少所有权证明仍不发按键。升级前先停止旧进程。
 
@@ -193,8 +214,9 @@ python3 yuutils/validate_watch_package.py
 
 JS 检查需 PATH 中的 Node.js。原生测试仅启动新隔离 HOME/TUI；不读真实凭据，
 不向现有会话发输入。TUI 测试通过真实 Unix HTTP 服务及 Python SO_PEERCRED 客户端
-触发一次原生发送 API，在 native `input` 事件返回 `handled` **阻止模型调用**；
-分别验证文字、原生图片占位、未结束粘贴、模态、overlay 和 429 拒绝，不保存终端输出。
+触发原生发送 API，在 native `input` 事件返回 `handled` **阻止模型调用**；
+分别验证文字、原生图片占位、未结束粘贴、模态、overlay、402 禁止，以及两次相同 429
+在真实 60 秒冷却后的恢复。TUI 测试含两段真实冷却等待，通常需约 2–3 分钟，不保存终端输出。
 
 ## 其他已安装内容
 

@@ -21,6 +21,17 @@ HERE = Path(__file__).resolve().parent
 ERROR = 'Error: Retry failed after 3 attempts: server_error: Our servers are currently overloaded. Please try again later.'
 PROMPT = '❯   Ask Step to do anything (/ for commands)'
 SCREEN = ERROR + '\n' + PROMPT
+RATE = ('Error: Retry failed after 3 attempts: OpenAI API error (429): '
+        '{"message":"Rate limit exceeded", "code":"rate_limit_exceeded"}')
+MULTILINE_RATE = ('Error: Retry failed after 3 attempts: OpenAI API error (429): '
+                  '{"message":"Rate limit exceeded\n [trace_id=synthetic\n code=20011]",'
+                  '"type":"rate_limit_exceeded","param":null,"code":"rate_limit_exceeded"}')
+QUOTA = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted.",'
+         '"code":api_key_quota_exhausted}')
+MULTILINE_QUOTA = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted. '
+                   '| Used 2001 of\n 2000 in the current cycle.","type":"insufficient_quota",'
+                   '"code":api_key_quota_exhausted"}')
+FOOTER = '\n Warning: Autopilot stopped after reaching its retry limit\n' + PROMPT
 FAKE = '''#!/usr/bin/env python3
 import json, os, select, sys, termios, time, tty
 from pathlib import Path
@@ -54,10 +65,22 @@ if mode in ('live_eof', 'eof_before_exit'):
         time.sleep(.05)
         sys.exit(7)
     time.sleep(30)
-if mode in ('rate', 'rate_query'):
+if mode in ('rate', 'rate_query', 'rate_repeat', 'wrong_cursor', 'rate_erase'):
     error = 'Error: Retry failed after 3 attempts: OpenAI API error (429): {"message":"Rate limit exceeded", "code":"rate_limit_exceeded"}'
-sys.stdout.write('\\x1b[2J\\x1b[H' + error + '\\r\\n' + prompt + '\\x1b[2;3H')
-sys.stdout.flush()
+footer = os.environ.get('FOOTER', '')
+columns = os.get_terminal_size(0).columns
+prompt_row = 1 + sum(max(1, (len(line) + columns - 1) // columns)
+                     for line in (error + footer).split('\\n'))
+def display(message, row):
+    sys.stdout.write('\\x1b[2J\\x1b[H' + message.replace('\\n', '\\r\\n') + '\\r\\n' + prompt
+                     + os.environ.get('TAIL', '').replace('\\n', '\\r\\n')
+                     + '\\x1b[%d;3H' % row)
+    sys.stdout.flush()
+display(error + footer, 1 if mode == 'wrong_cursor' else prompt_row)
+if mode == 'rate_erase':
+    sys.stdout.write('\\x1b[%d;%dH\\x1b[K\\x1b[%d;3H' % (prompt_row, len(prompt) + 1, prompt_row))
+    sys.stdout.flush()
+with open(os.environ['REPORT'], 'a') as f: f.write('cursor:%d,3\\n' % prompt_row)
 if mode == 'refresh':
     time.sleep(.1)
     sys.stdout.write('\\x1b[2J\\x1b[HCompleted successfully\\r\\n' + prompt + '\\x1b[2;3H')
@@ -81,6 +104,10 @@ while time.monotonic() < end:
         chunk = os.read(0, 1024)
         if not chunk: break
         data += chunk
+        if mode == 'rate_repeat' and data == b'continue\\r':
+            display('Working normally', 2)
+            time.sleep(.45)
+            display(error + footer, prompt_row)
         if mode == 'draft':
             sys.stdout.write('\\x1b[2J\\x1b[H' + error + '\\r\\n❯   draft\\x1b[2;10H')
             sys.stdout.flush()
@@ -90,6 +117,26 @@ sys.exit(7)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_wrapped_api_failures_and_quota_priority(self):
+        rate = ('Error: Retry failed after 3 attempts: OpenAI API error (429): '
+                '{"message":"Rate limit exceeded\n [trace_id=synthetic\n code=20011]",'
+                '"type":"rate_limit_exceeded","param":null,"code":"rate_limit_exceeded"}')
+        quota = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted. '
+                 '| Used 2001 of\n 2000 in the current cycle.","type":"insufficient_quota",'
+                 '"code":api_key_quota_exhausted"}')
+        footer = '\n Warning: Autopilot stopped after reaching its retry limit\n' + PROMPT
+        self.assertEqual(w.terminal_failure(rate + footer), 'rate limit')
+        self.assertEqual(w.terminal_failure(rate.replace('Retry failed after 3 attempts: ', '') + footer), 'rate limit')
+        self.assertEqual(w.terminal_failure(quota + footer), 'quota exhausted')
+        self.assertEqual(w.terminal_failure(quota.replace('exhausted.', 'exhausted. rate_limit_exceeded') + footer), 'quota exhausted')
+        # Only the current final error: older quota failures must not poison a new run.
+        self.assertEqual(w.terminal_failure(quota + '\n› continue\n' + rate + footer), 'rate limit')
+        for text in (rate + '\n› continue\nworking\n' + PROMPT,
+                     quota + '\nCompleted successfully\n' + PROMPT,
+                     rate.replace('rate_limit_exceeded', 'other_error') + footer,
+                     quota.replace('(402)', '(500)') + footer):
+            self.assertIsNone(w.terminal_failure(text))
+
     def test_user_environment_is_not_authority(self):
         with patch.dict(os.environ, {'USER': 'somebody-else'}):
             self.assertEqual(w.current_uid(), os.getuid())
@@ -218,6 +265,92 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(module.owned_agent({'uid': os.getuid(), 'pid': os.getpid()}))
 
 
+class ScreenTests(unittest.TestCase):
+    @staticmethod
+    def render(text, columns=80, lines=30):
+        import pyte
+        screen = w.recovery_screen(pyte, columns, lines)
+        stream = pyte.Stream(screen)
+        # Exercise metadata across feed/chunk boundaries, including Unicode.
+        for char in text.replace('\n', '\r\n'):
+            stream.feed(char)
+        return screen, stream
+
+    def test_soft_wrap_reconstructs_only_logical_lines(self):
+        for columns in (60, 80, 100):
+            for error, reason in ((ERROR, 'overload'), (RATE, 'rate limit'),
+                                  (MULTILINE_RATE, 'rate limit'), (QUOTA, 'quota exhausted'),
+                                  (MULTILINE_QUOTA, 'quota exhausted')):
+                with self.subTest(columns=columns, error=error):
+                    screen, _ = self.render(error + FOOTER, columns)
+                    self.assertEqual(screen.logical_display().splitlines(),
+                                     (error + FOOTER).splitlines())
+                    self.assertEqual(w.terminal_failure(screen.logical_display()), reason)
+
+    def test_hard_newlines_drafts_and_modals_are_not_joined(self):
+        for columns in (60, 80, 100):
+            for tail in ('\nmy multiline draft', '\nApprove this tool?',
+                         '\n' + 'draft ' * columns, '\n❯ another composer'):
+                with self.subTest(columns=columns, tail=tail):
+                    screen, _ = self.render(RATE + FOOTER + tail, columns)
+                    self.assertIsNone(w.terminal_failure(screen.logical_display()))
+            # Even a full-width hard newline must not be guessed to be a wrap.
+            text = ('x' * columns + '\n' + RATE + FOOTER)
+            screen, _ = self.render(text, columns)
+            self.assertEqual(screen.logical_display().splitlines(), text.splitlines())
+            for error in (RATE.replace('Rate limit', 'Rate l\nimit'),
+                          QUOTA.replace('exhausted', 'exhaus\nted')):
+                screen, _ = self.render(error + FOOTER, columns)
+                self.assertIsNone(w.terminal_failure(screen.logical_display()))
+
+    def test_blank_composer_erase_preserves_error_wraps(self):
+        for error, reason in ((RATE, 'rate limit'), (QUOTA, 'quota exhausted')):
+            screen, stream = self.render(error + FOOTER)
+            self.assertEqual(w.terminal_failure(screen.logical_display()), reason)
+            composer = next(y for y, row in enumerate(screen.display) if row.startswith('❯'))
+            stream.feed('\x1b[%d;%dH\x1b[K' % (composer + 1, len(PROMPT) + 1))
+            self.assertEqual(w.terminal_failure(screen.logical_display()), reason)
+
+    def test_cursor_edits_do_not_keep_stale_wrap_edges(self):
+        for column in (1, 10):
+            screen, stream = self.render(RATE + '\n' + PROMPT)
+            stream.feed('\x1b[2;%dH' % column + screen.display[1][column - 1])
+            self.assertIsNone(w.terminal_failure(screen.logical_display()))
+        screen, stream = self.render(RATE + '\n' + PROMPT)
+        stream.feed('\x1b[2;1H\x1b[L')
+        self.assertIsNone(w.terminal_failure(screen.logical_display()))
+
+    def test_unicode_cells_and_disabled_autowrap(self):
+        text = '界e\u0301' * 40 + '\n' + RATE + FOOTER
+        screen, _ = self.render(text)
+        self.assertEqual(screen.logical_display().splitlines(),
+                         text.replace('e\u0301', 'é').splitlines())
+        screen, stream = self.render('')
+        stream.feed('\x1b[?7l' + 'x' * 81)
+        self.assertFalse(any(getattr(line, '_wrap_next', None)
+                             for line in screen.buffer.values()))
+
+    def test_wrap_links_survive_scrolling_not_stale_edits(self):
+        text = RATE + '\n' + PROMPT
+        screen, _ = self.render('\n' * 12 + text, lines=4)
+        self.assertEqual(w.terminal_failure(screen.logical_display()), 'rate limit')
+        # Scroll an already-linked error, rather than only the preceding blanks.
+        screen, stream = self.render('\n' + text, lines=4)
+        stream.feed('\r\n')
+        self.assertEqual(w.terminal_failure(screen.logical_display()), 'rate limit')
+        for edit in ('\x1b[1;1H\x1b[K', '\x1b[1;1H\x1b[1J', '\x1b[1;1H\x1b[X',
+                     '\x1b[1;1H\x1b[P', '\x1b[1;1H\x1b[@', '\x1b[2J', '\x1bc'):
+            with self.subTest(edit=edit):
+                screen, stream = self.render(text)
+                stream.feed(edit)
+                self.assertTrue(all(getattr(line, '_wrap_next', None) is None
+                                    for line in screen.buffer.values()))
+        screen, _ = self.render(text)
+        screen.resize(30, 100)
+        self.assertTrue(all(getattr(line, '_wrap_next', None) is None
+                            for line in screen.buffer.values()))
+
+
 class PtyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -230,10 +363,10 @@ class PtyTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'],
                         REPORT=str(self.root / 'report'), ERROR=ERROR, PROMPT=PROMPT)
 
-    def spawn(self, cli='stepcode', mode='overload', balance='0', program=None):
+    def spawn(self, cli='stepcode', mode='overload', balance='0', program=None, columns=180):
         master, slave = pty.openpty()
         import fcntl
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 180, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, columns, 0, 0))
         saved = termios.tcgetattr(slave)
         direct = program is None
         if direct:
@@ -307,15 +440,62 @@ class PtyTests(unittest.TestCase):
                 self.assertEqual(report[-1], 'input:' + b'continue\r'.hex())
                 self.assertFalse(any(line.startswith('usage:') for line in report))
 
-    def test_real_pty_rate_balance_same_cli(self):
+    def test_real_80_column_pty_rate_and_quota(self):
+        for error, expected in ((RATE, b'continue\r'), (MULTILINE_RATE, b'continue\r'),
+                                (QUOTA, b''), (MULTILINE_QUOTA, b'')):
+            with self.subTest(error=error):
+                (self.root / 'report').unlink(missing_ok=True)
+                Path(self.env['REPORT'] + '.reserve').unlink(missing_ok=True)
+                self.env.update(ERROR=error, FOOTER=FOOTER.rsplit('\n', 1)[0])
+                self.assertEqual(self.finish(self.spawn(columns=80)), 7)
+                self.assertEqual(self.report()[-1], 'input:' + expected.hex())
+                row = 1 + sum(max(1, (len(line) + 79) // 80)
+                              for line in (error + self.env['FOOTER']).split('\n'))
+                self.assertIn('cursor:%d,3' % row, self.report())
+                self.assertEqual(Path(self.env['REPORT'] + '.reserve').exists(), bool(expected))
+                if not expected:
+                    self.assertIn(b'recovery=quota-exhausted', self.output)
+                self.assertFalse(any(line.startswith('usage:') for line in self.report()))
+
+    def test_real_80_column_pty_tail_and_cursor_stay_safe(self):
+        for mode, tail in (('rate', '\n' + 'draft ' * 30),
+                           ('rate', '\nApprove tool execution?'), ('wrong_cursor', '')):
+            with self.subTest(mode=mode, tail=tail):
+                (self.root / 'report').unlink(missing_ok=True)
+                self.env['TAIL'] = tail
+                self.assertEqual(self.finish(self.spawn(mode=mode, columns=80)), 7)
+                self.assertEqual(self.report()[-1], 'input:')
+                self.assertFalse(Path(self.env['REPORT'] + '.reserve').exists())
+
+    def test_real_80_column_pty_identical_rate_rearms_after_normal_quiet(self):
+        self.env['DURATION'] = '2'
+        self.assertEqual(self.finish(self.spawn(mode='rate_repeat', columns=80)), 7)
+        self.assertEqual(self.report()[-1], 'input:' + (b'continue\r' * 2).hex())
+        self.assertEqual(Path(self.env['REPORT'] + '.reserve').read_text(), 'reserve\n' * 2)
+        self.assertFalse(any(line.startswith('usage:') for line in self.report()))
+
+    def test_real_pty_blank_composer_erase_keeps_rate_candidate(self):
+        self.assertEqual(self.finish(self.spawn(mode='rate_erase', columns=80)), 7)
+        self.assertEqual(self.report()[-1], 'input:' + b'continue\r'.hex())
+
+    def test_real_pty_rate_retries_without_balance_lookup(self):
         for balance in ('0', '10'):
             with self.subTest(balance=balance):
                 (self.root / 'report').unlink(missing_ok=True)
                 self.assertEqual(self.finish(self.spawn('stepgo', 'rate', balance)), 7)
                 report = self.report()
-                self.assertIn('usage:stepgo', report)
-                inputs = [line for line in report if line.startswith('input:')]
-                self.assertEqual(inputs, ['input:' + (b'continue\r'.hex() if balance == '10' else '')])
+                self.assertFalse(any(line.startswith('usage:') for line in report))
+                self.assertEqual(report[-1], 'input:' + b'continue\r'.hex())
+                self.assertIn(b'mode=owned-pty', self.output)
+                self.assertIn(b'recovery=submitted-unconfirmed', self.output)
+
+    def test_real_pty_quota_never_sends_and_reports_reason(self):
+        self.env['ERROR'] = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted.",'
+                             '"code":api_key_quota_exhausted"}')
+        self.assertEqual(self.finish(self.spawn()), 7)
+        self.assertEqual(self.report()[-1], 'input:')
+        self.assertIn(b'recovery=quota-exhausted', self.output)
+        self.assertFalse(Path(self.env['REPORT'] + '.reserve').exists())
 
     def test_real_pty_draft_refresh_and_paste(self):
         for mode, data in [('draft', b'my draft'), ('overload', b'\x1b[200~paste\x1b[201~'), ('refresh', None)]:
@@ -403,52 +583,29 @@ class PtyTests(unittest.TestCase):
         child = int(Path(self.env['REPORT'] + '.pid').read_text())
         self.assertIsNone(w.process_identity(child, os.getuid(), allow_zombie=True))
 
-    def test_real_pty_balance_cancel_does_not_consume_event(self):
-        self.env['USAGE_DELAY'] = '.45'
-        self.env['DURATION'] = '3'
-        item = self.spawn(mode='rate_query', balance='10')
-        proc, master, _, _ = item
-        output = b''
-        deadline = time.monotonic() + 3
-        while ('usage:stepcode' not in self.report()
-               and time.monotonic() < deadline):
-            if select.select([master], [], [], .03)[0]:
-                output += os.read(master, 65536)
-        self.assertIn('usage:stepcode', self.report())
+    def test_real_pty_rate_query_rearms_without_balance(self):
         response = b'\x1b[2;3R'
-        os.write(master, response)
-        self.assertEqual(self.finish(item), 7)
+        self.assertEqual(self.finish(self.spawn(mode='rate'), response), 7)
         self.assertEqual(self.report()[-1], 'input:' + (response + b'continue\r').hex())
-        self.assertGreaterEqual(self.report().count('usage:stepcode'), 2)
+        self.assertFalse(any(line.startswith('usage:') for line in self.report()))
         self.assertEqual(Path(self.env['REPORT'] + '.reserve').read_text(), 'reserve\n')
 
-    def test_real_pty_draft_during_balance_cancels_without_reservation(self):
-        self.env['USAGE_DELAY'] = '.45'
-        self.env['DURATION'] = '3'
-        item = self.spawn(mode='rate', balance='10')
-        _, master, _, _ = item
-        deadline = time.monotonic() + 3
-        while 'usage:stepcode' not in self.report() and time.monotonic() < deadline:
-            if select.select([master], [], [], .03)[0]: os.read(master, 65536)
-        self.assertIn('usage:stepcode', self.report())
-        os.write(master, b'unresolved draft')
-        self.assertEqual(self.finish(item), 7)
+    def test_real_pty_rate_draft_cancels_without_reservation(self):
+        self.assertEqual(self.finish(self.spawn(mode='rate'), b'unresolved draft'), 7)
         self.assertEqual(self.report()[-1], 'input:' + b'unresolved draft'.hex())
         self.assertFalse(Path(self.env['REPORT'] + '.reserve').exists())
 
-    def test_real_pty_resize_during_balance_rechecks_quiet(self):
-        self.env['USAGE_DELAY'] = '.45'
-        self.env['DURATION'] = '3'
-        item = self.spawn(mode='rate', balance='10')
+    def test_real_pty_rate_resize_rechecks_quiet(self):
+        item = self.spawn(mode='rate')
         proc, master, _, _ = item
+        output = b''
         deadline = time.monotonic() + 3
-        while 'usage:stepcode' not in self.report() and time.monotonic() < deadline:
-            if select.select([master], [], [], .03)[0]: os.read(master, 65536)
-        self.assertIn('usage:stepcode', self.report())
-        time.sleep(.3)
+        while PROMPT.encode() not in output and time.monotonic() < deadline:
+            if select.select([master], [], [], .03)[0]: output += os.read(master, 65536)
+        self.assertIn(PROMPT.encode(), output)
         proc.send_signal(signal.SIGWINCH)
         self.assertEqual(self.finish(item), 7)
-        self.assertGreaterEqual(self.report().count('usage:stepcode'), 2)
+        self.assertFalse(any(line.startswith('usage:') for line in self.report()))
         self.assertEqual(Path(self.env['REPORT'] + '.reserve').read_text(), 'reserve\n')
 
     def test_child_exit_code_is_preserved(self):

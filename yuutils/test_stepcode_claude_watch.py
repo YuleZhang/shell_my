@@ -112,7 +112,8 @@ class WatchTests(unittest.TestCase):
                 self.assertIsNone(w.terminal_failure(text))
 
     def test_rate_limit_requires_terminal_error(self):
-        for text in [RATE_ERROR, RATE_ERROR.replace('Retry failed after 3 attempts: ', '') + FOOTER,
+        self.assertEqual(w.terminal_failure(RATE_ERROR.replace('Retry failed after 3 attempts: ', '') + FOOTER), 'rate limit')
+        for text in [RATE_ERROR,
                      RATE_SCREEN.replace('rate_limit_exceeded', 'other_error'),
                      RATE_ERROR + '\n• Completed successfully' + FOOTER]:
             with self.subTest(text=text):
@@ -128,24 +129,20 @@ class WatchTests(unittest.TestCase):
         with patch.object(w.subprocess, 'run', side_effect=subprocess.TimeoutExpired('stepcode', 15)):
             self.assertFalse(w.has_stepcode_balance())
 
-    def test_rate_limit_checks_balance_before_continue(self):
+    def test_rate_limit_does_not_query_balance_and_quota_never_sends(self):
         with patch.object(w, 'agents_by_pane', return_value={'test:p1': AGENT}), \
              patch.object(w, 'herdr_read', return_value=RATE_SCREEN), \
              patch.object(w, 'has_stepcode_balance', return_value=False) as balance, \
-             patch.object(w.subprocess, 'run') as run, patch.object(w.time, 'monotonic', return_value=100):
-            checked = {}
-            self.assertFalse(w.recover_overload(AGENT, RATE_SCREEN, {}, checked))
-            self.assertFalse(w.recover_overload(AGENT, RATE_SCREEN, {}, checked))
-            balance.assert_called_once_with()
-            run.assert_not_called()
-        with patch.object(w, 'agents_by_pane', return_value={'test:p1': AGENT}), \
-             patch.object(w, 'herdr_read', return_value=RATE_SCREEN), \
-             patch.object(w, 'has_stepcode_balance', return_value=True) as balance, \
              patch.object(w.subprocess, 'run') as run:
             self.assertTrue(w.recover_overload(AGENT, RATE_SCREEN, {}, {}))
-            balance.assert_called_once_with()
+            balance.assert_not_called()
             run.assert_called_once_with(['herdr', 'pane', 'run', 'test:p1', 'continue'],
-                                        check=True, timeout=10, capture_output=True, text=True)
+                                       check=True, timeout=10, capture_output=True, text=True)
+        quota = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted.",'
+                 '"code":api_key_quota_exhausted"}' + FOOTER)
+        with patch.object(w.subprocess, 'run') as run:
+            self.assertFalse(w.recover_overload(AGENT, quota, {}))
+            run.assert_not_called()
 
     def test_claude_regression(self):
         self.assertEqual(w.active_retry('Retrying ... attempt 3/10'), (3, 10))

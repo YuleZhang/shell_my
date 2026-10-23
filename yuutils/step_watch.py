@@ -23,10 +23,12 @@ OVERLOADED = (r"(?:server_error:\s*)?Our\s+servers\s+are\s+currently\s+"
 OVERLOAD_RETRY_FAILED = re.compile(
     r"^\s*(?:•\s*)?Error:\s*Retry\s+failed\s+after\s+\d+\s+attempts?:\s*" + OVERLOADED,
     re.I | re.M)
-RATE_LIMIT_RETRY_FAILED = re.compile(
-    r'^\s*(?:•\s*)?Error:\s*Retry\s+failed\s+after\s+\d+\s+attempts?:\s*'
-    r'OpenAI API error\s*\(429\):\s*\{[^\n]*"message"\s*:\s*"Rate limit exceeded\b'
-    r'[^\n]*"code"\s*:\s*"rate_limit_exceeded"\s*\}', re.I | re.M)
+API_FAILURE = re.compile(
+    r'^\s*(?:•\s*)?Error:\s*(?:Retry\s+failed\s+after\s+\d+\s+attempts?:\s*)?'
+    r'OpenAI\s+API\s+error\s*\((402|429)\):\s*\{[^{}]*\}', re.I | re.M)
+KEY_QUOTA = re.compile(r'API\s+Key\s+quota\s+has\s+been\s+exhausted\b|\bapi_key_quota_exhausted\b', re.I)
+RATE_LIMIT = re.compile(r'"message"\s*:\s*"Rate\s+limit\s+exceeded\b', re.I)
+RATE_CODE = re.compile(r'"code"\s*:\s*"rate_limit_exceeded"', re.I)
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 REMAINING = re.compile(r"Remaining\s*¥\s*([\d,]+(?:\.\d+)?)", re.I)
 QUIET_WINDOW = 3.0
@@ -102,12 +104,19 @@ def clean(text):
 
 def terminal_failure(text):
     text = clean(text)
-    matches = [(m, reason) for pattern, reason in (
-        (OVERLOAD_RETRY_FAILED, 'overload'), (RATE_LIMIT_RETRY_FAILED, 'rate limit'))
-        for m in pattern.finditer(text)]
+    matches = [(m, 'overload') for m in OVERLOAD_RETRY_FAILED.finditer(text)]
+    for m in API_FAILURE.finditer(text):
+        error = m.group(0)
+        reason = ('quota exhausted' if m.group(1) == '402' and KEY_QUOTA.search(error)
+                  else 'rate limit' if m.group(1) == '429' and RATE_LIMIT.search(error)
+                  and RATE_CODE.search(error) else None)
+        # An unrelated later API error must not revive an older candidate.
+        matches.append((m, reason))
     if not matches:
         return None
     match, reason = max(matches, key=lambda item: item[0].start())
+    if reason is None:
+        return None
     tail = text[match.end():]
     prompts = list(re.finditer(r'^[❯›>]\s+Ask Step to do anything \(/ for commands\)\s*$', tail, re.M))
     if len(prompts) != 1:
@@ -232,7 +241,8 @@ class RecoveryGate:
                 or now - self.changed < self.quiet
                 or now - self.last_attempt < self.cooldown):
             return None
-        return terminal_failure(screen)
+        reason = terminal_failure(screen)
+        return None if reason == 'quota exhausted' else reason
 
     def reserve(self, now):
         self.last_attempt = now
@@ -281,6 +291,97 @@ def write_all(fd, data):
         data = data[count:]
 
 
+def recovery_screen(pyte, columns, lines):
+    """Keep only proven autowrap edges; pyte remains an optional run dependency."""
+    import weakref
+
+    class RecoveryScreen(pyte.Screen):
+        _drawing = False
+        _draw_end = None
+
+        def clear_wraps(self):
+            self._draw_end = None
+            for line in self.buffer.values():
+                line._wrap_next = None
+
+        def unlink(self, line):
+            line._wrap_next = None
+            for previous in self.buffer.values():
+                link = getattr(previous, '_wrap_next', None)
+                if link is not None and link() is line:
+                    previous._wrap_next = None
+
+        def draw(self, data):
+            # Only Screen.draw invokes linefeed for DECAWM. Do not infer wraps
+            # from full rows: CR/LF, cursor positioning and drafts are distinct.
+            # Consecutive draw chunks are still the same write; a repositioned
+            # edit invalidates both edges of the destination row.
+            position = (self.buffer[self.cursor.y], self.cursor.x)
+            if self._draw_end is None or not (self._draw_end[0] is position[0]
+                                              and self._draw_end[1] == position[1]):
+                self.unlink(position[0])
+            self._drawing = True
+            try:
+                super().draw(data)
+            finally:
+                self._drawing = False
+                self._draw_end = (self.buffer[self.cursor.y], self.cursor.x)
+
+        def linefeed(self):
+            previous = self.buffer[self.cursor.y]
+            if not self._drawing:
+                self._draw_end = None
+            previous._wrap_next = None
+            super().linefeed()
+            following = self.buffer[self.cursor.y]
+            self.unlink(following)
+            if self._drawing and following is not previous:
+                # Row identity follows scrolling; weak refs do not retain rows
+                # which were removed, nor accept a newly inserted adjacent row.
+                previous._wrap_next = weakref.ref(following)
+
+        def erase_characters(self, *args, **kwargs):
+            self.clear_wraps()
+            super().erase_characters(*args, **kwargs)
+
+        def delete_characters(self, *args, **kwargs):
+            self.clear_wraps()
+            super().delete_characters(*args, **kwargs)
+
+        def insert_characters(self, *args, **kwargs):
+            self.clear_wraps()
+            super().insert_characters(*args, **kwargs)
+
+        def erase_in_line(self, *args, **kwargs):
+            self._draw_end = None
+            self.unlink(self.buffer[self.cursor.y])
+            super().erase_in_line(*args, **kwargs)
+
+        def erase_in_display(self, *args, **kwargs):
+            self.clear_wraps()
+            super().erase_in_display(*args, **kwargs)
+
+        def reset(self):
+            self.clear_wraps()
+            super().reset()
+
+        def resize(self, *args, **kwargs):
+            self.clear_wraps()
+            super().resize(*args, **kwargs)
+
+        def logical_display(self):
+            rows = self.display
+            text = []
+            for y, row in enumerate(rows):
+                link = getattr(self.buffer[y], '_wrap_next', None)
+                wrapped = (y + 1 < self.lines and link is not None
+                           and link() is self.buffer[y + 1])
+                text.append(row if wrapped else row.rstrip() + '\n')
+            return ''.join(text).rstrip('\n')
+
+    return RecoveryScreen(columns, lines)
+
+
 def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
     try:
         import pyte
@@ -291,13 +392,14 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
         raise RuntimeError('run needs a Linux interactive terminal (SSH -t); cannot attach existing agents')
     cli = choose_cli(cli)
     command = launch_command(cli, arguments)
-    print('step-watch: %s%s' % (Path(cli).name, ' agent run stepcli' if len(command) > 3
-                              and command[1:4] == ['agent', 'run', 'stepcli'] else ''), flush=True)
+    print('step-watch: mode=owned-pty UID=%d quiet=%gs cooldown=%gs; '
+          'retry=429,overload deny=402-key-quota-exhausted balance-check=disabled' %
+          (uid, quiet, cooldown), flush=True)
     saved = termios.tcgetattr(0)
     handlers = {}
     pid = master = identity = None
     exit_signal = [0]
-    screen = pyte.Screen(80, 24)
+    screen = recovery_screen(pyte, 80, 24)
     stream = pyte.Stream(screen)
     decoder = codecs.getincrementaldecoder('utf-8')('replace')
     gate = RecoveryGate(quiet, cooldown)
@@ -333,6 +435,7 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
         gate.blocked = False
         tty.setraw(0)
         status = None
+        reported_reason = None
         while True:
             info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
             if info is not None:
@@ -374,10 +477,15 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
                     return status if status is not None else 0
                 write_all(1, data)
                 stream.feed(decoder.decode(data))
-                gate.output('\n'.join(screen.display), time.monotonic())
+                gate.output(screen.logical_display(), time.monotonic())
             if status is not None:
                 continue
-            visible = '\n'.join(screen.display)
+            visible = screen.logical_display()
+            failure = terminal_failure(visible)
+            if failure != reported_reason:
+                if failure == 'quota exhausted':
+                    write_all(2, b'\r\nstep-watch: recovery=quota-exhausted; automatic continue disabled\r\n')
+                reported_reason = failure
             reason = gate.ready(visible, time.monotonic())
             if reason:
                 # Cursor must be in the blank composer, not approval/tool UI.
@@ -386,17 +494,16 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
                     continue
                 if process_identity(pid, uid) != identity:
                     continue
-                if reason == 'rate limit' and not has_balance(cli):
-                    continue
-                # Balance checks can block: drain pending output/input before send.
+                # Drain pending output/input before sending recovery.
                 if select.select([0, master], [], [], 0)[0]:
                     continue
                 if current_uid() != uid or process_identity(pid, uid) != identity:
                     continue
-                if gate.ready('\n'.join(screen.display), time.monotonic()) != reason:
+                if gate.ready(screen.logical_display(), time.monotonic()) != reason:
                     continue
                 gate.reserve(time.monotonic())
                 write_all(master, b'continue\r')
+                write_all(2, ('\r\nstep-watch: recovery=submitted-unconfirmed reason=%s\r\n' % reason).encode())
     except KeyboardInterrupt:
         return 128 + (exit_signal[0] or signal.SIGINT)
     finally:
