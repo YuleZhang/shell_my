@@ -64,7 +64,13 @@ def main():
         run([sys.executable, 'setup.py', 'bdist_wheel'], rebuilt)
         run([sys.executable, '-m', 'venv', '--system-site-packages', str(root / 'venv')], root)
         python = root / 'venv/bin/python'
-        run([str(python), '-m', 'pip', 'install', '--no-index', '--no-deps', str(wheel)], root)
+        run([str(python), '-m', 'pip', 'install', '--no-index', '--no-deps',
+             '--ignore-installed', str(wheel)], root)
+        # A same-version global install must not satisfy this isolated wheel test.
+        run([str(python), '-c',
+             "from pathlib import Path; import step_watch,step_watch_daemon,sys; "
+             "assert all(Path(sys.prefix).resolve() in Path(m.__file__).resolve().parents "
+             "for m in (step_watch,step_watch_daemon))"], root)
         home = root / 'home'
         home.mkdir(mode=0o700)
         env = dict(os.environ, HOME=str(home), YUUTILS_WATCH_RUNTIME=str(root / 'ipc'))

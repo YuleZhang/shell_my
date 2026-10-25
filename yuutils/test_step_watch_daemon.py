@@ -1,5 +1,7 @@
 """Synthetic Linux processes and real Unix IPC; never attaches to live agents."""
+import contextlib
 import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -59,7 +61,7 @@ class IPC(unittest.TestCase):
         file.write_text('x' * (d.MAX_PACKET + 1))
         with self.assertRaises(RuntimeError): d.read_private(file)
 
-    def socket_server(self):
+    def socket_server(self, response=None):
         generation = 'a' * 32
         pid, start = d.process_identity(os.getpid(), os.getuid())
         meta = {'pid': pid, 'start': start, 'generation': generation, 'cap': 'b' * 64}
@@ -81,8 +83,9 @@ class IPC(unittest.TestCase):
                     assert request['cap'] == meta['cap']
                     assert request['op'] == 'status'
                     assert set(request) == {'op', 'cap', 'nonce', 'generation'}
-                    payload = json.dumps({'recovery': 'ui-safety-unavailable', 'eligible': False,
-                                          'transcript': 'MUST_NOT_RELAY'}).encode()
+                    payload = json.dumps(response if response is not None else {
+                        'recovery': 'ui-safety-unavailable', 'eligible': False,
+                        'transcript': 'MUST_NOT_RELAY'}).encode()
                     conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(payload)).encode()
                                  + b'\r\nConnection: close\r\n\r\n' + payload)
             except Exception as error: errors.append(type(error).__name__)
@@ -250,8 +253,10 @@ class IPC(unittest.TestCase):
         self.addCleanup(stop.set)
         self.addCleanup(lambda: self.cli('stop'))
         for command, bound in [('start', 2), ('status', 1)]:
-            begin = time.monotonic(); self.cli(command)
+            begin = time.monotonic(); output = self.cli(command)
             self.assertLess(time.monotonic() - begin, bound)
+            self.assertIn('scan=discovering (initial scan in progress)', output)
+            self.assertNotIn('connected=0 unbridged=0', output)
         self.assertTrue(recovered.wait(3), 'healthy endpoint starved by stalled endpoints')
         begin = time.monotonic(); self.cli('stop')
         self.assertLess(time.monotonic() - begin, 2)
@@ -260,22 +265,261 @@ class IPC(unittest.TestCase):
     def test_failed_readiness_reaps_only_spawned_child(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
         self.addCleanup(lambda: self.end(child))
+        output = io.StringIO()
         with patch.object(d, 'install_extension', return_value=[]), patch.object(
                 d, 'daemon_state', return_value=None), patch.object(d.subprocess, 'Popen', return_value=child), patch.object(
-                d.time, 'sleep', return_value=None):
+                d.time, 'sleep', return_value=None), contextlib.redirect_stderr(output):
             self.assertEqual(d.main(['start']), 2)
+        self.assertIn('readiness-timeout', output.getvalue())
         self.assertIsNotNone(child.poll())
+
+    def test_pre_readiness_private_metadata_failure_logs_and_reports_early_exit(self):
+        for name in ('status.json', 'daemon.json'):
+            with self.subTest(name=name):
+                (self.root / 'daemon.log').unlink(missing_ok=True)
+                metadata = self.root / name
+                metadata.write_text('PRIVATE_METADATA_TEXT')
+                metadata.chmod(0o644)
+                result = subprocess.run([sys.executable, '-m', 'step_watch_daemon', 'start'],
+                                        cwd=self.root, env=self.env, text=True,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('readiness-exit:', result.stderr)
+                self.assertIn('private daemon.log', result.stderr)
+                self.assertNotIn('readiness-timeout', result.stderr)
+                log = self.root / 'daemon.log'
+                self.assertIn('failure: private-file:', log.read_text())
+                self.assertIn('mode 0600', log.read_text())
+                self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+                self.assertNotIn('PRIVATE_', result.stdout + result.stderr + log.read_text())
+                self.assertTrue(metadata.exists())
+                self.assertEqual(metadata.read_text(), 'PRIVATE_METADATA_TEXT')
+                self.assertEqual(stat.S_IMODE(metadata.stat().st_mode), 0o644)
+                metadata.unlink()
+
+    def test_early_child_exit_diagnostic_does_not_read_arbitrary_log(self):
+        log = self.root / 'daemon.log'
+        log.write_text('PRIVATE_LOG_TEXT\nfailure: private-file: PRIVATE_FAKE_DIAGNOSTIC\n')
+        log.chmod(0o600)
+        child = subprocess.Popen([sys.executable, '-c', 'raise SystemExit(7)'])
+        self.addCleanup(lambda: self.end(child))
+        child.wait(timeout=5)
+        output = io.StringIO()
+        with patch.object(d, 'install_extension', return_value=[]), patch.object(
+                d, 'daemon_state', return_value=None), patch.object(d.subprocess, 'Popen', return_value=child), patch.object(
+                d.time, 'sleep') as sleep, contextlib.redirect_stderr(output):
+            self.assertEqual(d.main(['start']), 2)
+            sleep.assert_not_called()
+        self.assertIn('readiness-exit:', output.getvalue())
+        self.assertIn('private daemon.log if available', output.getvalue())
+        self.assertNotIn('readiness-timeout', output.getvalue())
+        self.assertNotIn('PRIVATE_', output.getvalue())
+        self.assertNotIn('failure: private-file:', output.getvalue())
+        self.assertEqual(child.poll(), 7)
+
+    def test_pre_readiness_arbitrary_failure_is_sanitized_and_lock_released(self):
+        for target in ('status.json', 'daemon.json'):
+            with self.subTest(target=target):
+                (self.root / 'daemon.log').unlink(missing_ok=True)
+                original = d.write_private
+                def fail_initialization(path, value):
+                    if path.name == target:
+                        raise RuntimeError('PRIVATE_EXCEPTION_TEXT')
+                    return original(path, value)
+                with patch('signal.signal'), patch.object(
+                        d, 'write_private', side_effect=fail_initialization), patch.object(d, 'snapshot') as scan:
+                    with self.assertRaises(RuntimeError):
+                        d.serve(self.root)
+                    scan.assert_not_called()
+                log = (self.root / 'daemon.log').read_text()
+                self.assertIn('failure: operation-refused:', log)
+                self.assertNotIn('PRIVATE_', log)
+                self.assertTrue(log.endswith('stopped\n'))
+                self.assertFalse((self.root / 'daemon.json').exists())
+                lock = d.private_open(self.root / 'daemon.lock', os.O_RDWR)
+                try:
+                    d.fcntl.flock(lock, d.fcntl.LOCK_EX | d.fcntl.LOCK_NB)
+                finally:
+                    os.close(lock)
+
+    def test_lock_open_failure_uses_private_log_without_removing_metadata(self):
+        lock = self.root / 'daemon.lock'
+        lock.write_text('PRIVATE_LOCK_TEXT')
+        lock.chmod(0o644)
+        d.write_private(self.root / 'daemon.json', {'untouched': True})
+        with self.assertRaises(RuntimeError):
+            d.serve(self.root)
+        log = self.root / 'daemon.log'
+        self.assertIn('failure: private-file:', log.read_text())
+        self.assertNotIn('PRIVATE_', log.read_text())
+        self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+        self.assertEqual(lock.read_text(), 'PRIVATE_LOCK_TEXT')
+        self.assertEqual(d.read_private(self.root / 'daemon.json'), {'untouched': True})
+
+    def test_unsafe_log_and_runtime_failures_do_not_write_or_echo_contents(self):
+        target = self.root / 'target'
+        target.write_text('PRIVATE_LOG_TEXT')
+        target.chmod(0o600)
+        log = self.root / 'daemon.log'
+        for kind in ('mode', 'symlink', 'hardlink', 'runtime'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    log.symlink_to(target)
+                elif kind == 'hardlink':
+                    os.link(target, log)
+                else:
+                    log.write_text('PRIVATE_LOG_TEXT')
+                    log.chmod(0o644 if kind == 'mode' else 0o600)
+                if kind == 'runtime':
+                    self.root.chmod(0o755)
+                try:
+                    result = subprocess.run([sys.executable, '-m', 'step_watch_daemon', '_daemon'],
+                                            cwd=self.root, env=self.env, text=True,
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn('private-directory:' if kind == 'runtime' else
+                                  'symlink-refused:' if kind == 'symlink' else 'private-file:', result.stderr)
+                    self.assertNotIn('PRIVATE_', result.stdout + result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual(log.read_text(), 'PRIVATE_LOG_TEXT')
+                    self.assertEqual(target.read_text(), 'PRIVATE_LOG_TEXT')
+                    self.assertFalse((self.root / 'daemon.json').exists())
+                finally:
+                    self.root.chmod(0o700)
+                    log.unlink()
 
     def test_cached_report_rejects_stale_identity_and_arbitrary_text(self):
         pid, start = d.process_identity(os.getpid(), os.getuid())
         state = {'pid': pid, 'start': start}
         value = {'uid': os.getuid(), **state, 'updated': time.time(), 'sessions': [
             {**state, 'state': 'connected', 'recovery': 'PRIVATE_TEXT'}]}
+        for recovery in ('PRIVATE_TEXT', ['PRIVATE_TEXT'], 'quota-exhausted'):
+            value['sessions'][0]['recovery'] = recovery
+            d.write_private(self.root / 'status.json', value)
+            expected = recovery if recovery == 'quota-exhausted' else 'unavailable'
+            self.assertEqual(d.cached_rows(self.root, state)[0]['recovery'], expected)
+        value['sessions'].append({**state, 'state': ['PRIVATE_STATE']})
         d.write_private(self.root / 'status.json', value)
-        self.assertEqual(d.cached_rows(self.root, state)[0]['recovery'], 'unavailable')
+        self.assertEqual(len(d.cached_rows(self.root, state)), 1)
         for changes in ({'start': '0'}, {'updated': time.time() - 20}, {'uid': os.getuid() + 1}):
             d.write_private(self.root / 'status.json', {**value, **changes})
             self.assertEqual(d.cached_rows(self.root, state), [])
+
+    def test_quota_enum_and_malformed_bridge_diagnostics(self):
+        for response, expected in [
+                ({'recovery': 'quota-exhausted', 'eligible': False,
+                  'error': 'PRIVATE_BRIDGE_TEXT'}, 'quota-exhausted'),
+                ({'recovery': ['PRIVATE_BRIDGE_TEXT'], 'eligible': False}, 'unknown')]:
+            with self.subTest(response_type=type(response['recovery']).__name__):
+                meta, path, handle, errors = self.socket_server(response)
+                thread = threading.Thread(target=handle); thread.start()
+                try:
+                    self.assertEqual(d.bridge_request(self.root, meta),
+                                     {'recovery': expected, 'eligible': False})
+                finally:
+                    thread.join(2)
+                    path.unlink()
+                self.assertEqual(errors, [])
+
+    def test_start_report_distinguishes_initial_scan_from_empty_complete(self):
+        pid, start = d.process_identity(os.getpid(), os.getuid())
+        state = {'pid': pid, 'start': start}
+        for scan, expected in [('discovering', 'scan=discovering (initial scan in progress)'),
+                               ('complete', 'scan=complete')]:
+            d.write_private(self.root / 'status.json', {
+                'uid': os.getuid(), **state, 'updated': time.time(),
+                'scan': scan, 'sessions': []})
+            output = io.StringIO()
+            with patch.object(d, 'daemon_state', return_value=state), contextlib.redirect_stdout(output):
+                d.report(self.root)
+            self.assertIn(expected, output.getvalue())
+            if scan == 'discovering':
+                self.assertNotIn('connected=0 unbridged=0', output.getvalue())
+            else:
+                self.assertIn('connected=0 unbridged=0', output.getvalue())
+
+    def test_safe_actionable_failures_do_not_echo_arbitrary_exceptions(self):
+        cases = [
+            (RuntimeError('daemon readiness timed out'), 'readiness-timeout', 'daemon.log'),
+            (RuntimeError('extension already exists with different content; review/remove it manually'),
+             'extension-conflict', 'manually'),
+            (RuntimeError('symlink state directory is not supported'), 'symlink-refused', 'symlink'),
+            (RuntimeError('PRIVATE_EXCEPTION_TEXT'), 'operation-refused', 'private'),
+            (ValueError('PRIVATE_EXCEPTION_TEXT'), 'invalid-metadata', 'metadata'),
+            (OSError(__import__('errno').ELOOP, 'PRIVATE_EXCEPTION_TEXT', 'PRIVATE_PATH'),
+             'symlink-refused', 'symlink'),
+            (OSError(__import__('errno').EACCES, 'PRIVATE_EXCEPTION_TEXT', 'PRIVATE_PATH'),
+             'permission-denied', 'permissions'),
+        ]
+        for error, reason, hint in cases:
+            with self.subTest(reason=reason):
+                output = io.StringIO()
+                with patch.object(d, 'runtime_directory', side_effect=error), contextlib.redirect_stderr(output):
+                    self.assertEqual(d.main(['status']), 2)
+                self.assertIn(reason, output.getvalue())
+                self.assertIn(hint, output.getvalue())
+                self.assertNotIn('PRIVATE_', output.getvalue())
+
+    def test_daemon_failure_log_is_safe_and_cleanup_preserved(self):
+        for error, reason in [(RuntimeError('daemon stop timed out'), 'stop-timeout'),
+                              (RuntimeError('PRIVATE_EXCEPTION_TEXT'), 'operation-refused')]:
+            with self.subTest(reason=reason), patch('signal.signal'), patch.object(
+                    d, 'snapshot', side_effect=error):
+                with self.assertRaises(RuntimeError):
+                    d.serve(self.root)
+            log = (self.root / 'daemon.log').read_text()
+            self.assertIn('failure: %s:' % reason, log)
+            self.assertNotIn('PRIVATE_', log)
+            self.assertTrue(log.endswith('stopped\n'))
+            self.assertFalse((self.root / 'daemon.json').exists())
+
+    def test_missing_bridge_does_not_misreport_live_process_exit(self):
+        pid, start = d.process_identity(os.getpid(), os.getuid())
+        previous = {(pid, start): ('connected', 'no-candidate')}
+        log = io.StringIO()
+        d.log_transitions(log, previous, [])
+        self.assertNotIn('state=exited', log.getvalue())
+        self.assertIn('PID=%d state=unbridged recovery=unavailable' % pid, log.getvalue())
+
+    def test_daemon_logs_initial_nonrecover_scan_transitions_submission_and_exit(self):
+        callbacks, scans = {}, []
+        connected = {'pid': 101, 'start': 'PRIVATE_START', 'state': 'connected',
+                     'recovery': 'quota-exhausted', 'transcript': 'PRIVATE_TRANSCRIPT',
+                     'cmdline': 'PRIVATE_CMDLINE', 'cap': 'PRIVATE_CAP'}
+        unbridged = {'pid': 102, 'start': '2', 'state': 'needs-extension-load',
+                    'recovery': ['PRIVATE_RECOVERY']}
+        invalid = {'pid': 103, 'start': '3', 'state': 'PRIVATE_STATE'}
+        batches = [[connected, unbridged, invalid], [connected, unbridged, invalid],
+                   [{**connected, 'recovery': 'submitted-unconfirmed'}, unbridged],
+                   [{**connected, 'recovery': 'cooldown'}, unbridged], []]
+        sleeps = [0]
+        def scan(root, recover=False):
+            if not scans:
+                self.assertEqual(d.read_private(root / 'status.json')['scan'], 'discovering')
+            scans.append(recover)
+            return batches[len(scans) - 1]
+        def sleep(_):
+            sleeps[0] += 1
+            if sleeps[0] == 50:
+                callbacks[__import__('signal').SIGTERM]()
+        with patch('signal.signal', side_effect=lambda sig, callback: callbacks.__setitem__(sig, callback)), patch.object(
+                d, 'snapshot', side_effect=scan), patch.object(d.time, 'sleep', side_effect=sleep), patch.object(
+                d, 'process_identity', side_effect=lambda pid, uid: (pid, '1') if pid == os.getpid() else None):
+            self.assertEqual(d.serve(self.root), 0)
+        self.assertEqual(scans, [False, True, True, True, True])
+        log = (self.root / 'daemon.log').read_text()
+        self.assertEqual(stat.S_IMODE((self.root / 'daemon.log').stat().st_mode), 0o600)
+        self.assertIn('policy: retry=overload,rate-limit quota-exhausted=blocked quiet=3s cooldown=60s', log)
+        self.assertIn('initial scan complete connected=1 unbridged=1', log)
+        self.assertEqual(log.count('PID=101 state=connected recovery=quota-exhausted'), 1)
+        self.assertIn('PID=102 state=needs-extension-load recovery=unavailable', log)
+        self.assertIn('PID=101 state=connected recovery=submitted-unconfirmed', log)
+        self.assertIn('continue submitted PID=101 confirmation=unconfirmed', log)
+        self.assertIn('PID=101 state=connected recovery=cooldown', log)
+        self.assertIn('PID=101 state=exited recovery=unavailable', log)
+        self.assertIn('stopped', log)
+        self.assertNotIn('PRIVATE_', log)
+        self.assertNotIn('PRIVATE_', json.dumps(d.read_private(self.root / 'status.json')))
 
     def test_installer_explicit_conflict_symlink(self):
         root = self.root / 'agent'
@@ -283,6 +527,12 @@ class IPC(unittest.TestCase):
         self.assertEqual(d.install_extension([str(root)]), paths)
         target = Path(paths[0]); target.write_text('user extension')
         with self.assertRaises(RuntimeError): d.install_extension([str(root)])
+        self.assertEqual(target.read_text(), 'user extension')
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(d.main(['install-extension', '--agent-dir', str(root)]), 2)
+        self.assertIn('extension-conflict', error.getvalue())
+        self.assertEqual(target.read_text(), 'user extension')
         target.unlink(); target.symlink_to(self.root / 'absent')
         with self.assertRaises(OSError): d.install_extension([str(root)])
 

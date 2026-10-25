@@ -46,12 +46,41 @@ for (const stopReason of ['stop', 'aborted', 'length']) {
 }
 gate.end({ messages: [...failure.messages, { role: 'assistant', stopReason: 'stop' }] });
 assert.equal(gate.candidate, null);
-gate.end({ messages: [{ role: 'assistant', stopReason: 'error', errorMessage: 'rate_limit_exceeded' }] });
+const rateError = 'Error: Retry failed after 3 attempts: OpenAI API error (429): {"message":"Rate limit exceeded\n [trace_id=synthetic\n code=20011]","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}';
+const quotaError = 'Error: OpenAI API error (402): {"message":"API Key quota has been exhausted. | Used 2001 of\n 2000 in the current cycle.","type":"insufficient_quota","code":api_key_quota_exhausted"}';
+const fail = errorMessage => ({ messages: [{ role: 'assistant', stopReason: 'error', errorMessage }] });
+// Settlement is required, even after the native retry budget is exhausted.
+time += 60000;
+gate.end(fail(rateError));
+assert.equal(gate.status(ctx, safe).recovery, 'not-settled');
 gate.settle(); time += 3001;
-assert.equal(gate.status(ctx, safe).recovery, 'balance-unverified');
-assert.equal(gate.status(ctx, { ...safe, balanceVerified: true }).recovery, 'balance-unverified');
-gate.recover({ sendUserMessage: () => { throw Error('private'); } }, ctx, { ...safe, balanceVerified: true });
-assert.equal(gate.candidate, 'rate-limit');
+assert.equal(gate.status(ctx, safe).eligible, true);
+gate.recover({ sendUserMessage: (...args) => sends.push(args) }, ctx, safe);
+assert.equal(gate.candidate, null);
+assert.equal(sends.length, 2);
+// Identical errors in new runs remain recoverable after the cooldown.
+gate.end(fail(rateError)); gate.settle(); time += 3001;
+assert.equal(gate.status(ctx, safe).recovery, 'cooldown');
+time += 60000;
+gate.recover({ sendUserMessage: (...args) => sends.push(args) }, ctx, safe);
+assert.equal(sends.length, 3);
+for (const message of [quotaError, quotaError + '\nrate_limit_exceeded\n' + failure.messages[0].errorMessage]) {
+  gate.end(fail(message)); gate.settle(); time += 60001;
+  assert.equal(gate.status(ctx, safe).recovery, 'quota-exhausted');
+  gate.recover({ sendUserMessage: () => assert.fail('quota must never send') }, ctx, safe);
+}
+for (const message of ['API Key quota has been exhausted', 'OpenAI API error (402): unrelated',
+                       'Error: OpenAI API error (500): unrelated']) {
+  gate.end(fail(message));
+  assert.equal(gate.status(ctx, safe).recovery, 'no-candidate');
+}
+gate.end(fail(rateError)); gate.end({ messages: [{ role: 'assistant', stopReason: 'stop' }] });
+gate.settle(); time += 3001;
+assert.equal(gate.status(ctx, safe).recovery, 'no-candidate');
+gate.end(fail('rate_limit_exceeded')); gate.settle(); time += 60001;
+gate.recover({ sendUserMessage: () => { throw Error('private'); } }, ctx, safe);
+assert.equal(gate.candidate, null);
+assert.equal(gate.recover({}, ctx, safe).eligible, false);
 gate.cancel();
 time += 60000; arm();
 gate.recover({ sendUserMessage: () => { throw Error('private'); } }, ctx, safe);
