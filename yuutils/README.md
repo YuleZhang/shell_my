@@ -140,6 +140,9 @@ jq '{schema_version,kind,status,measurement_valid,exit_code,validity,performance
   不应直接上传。日志原文不修改；CSV pull 每次尝试保留独立日志。stdout 的 summary hash
   指向磁盘 `summary.json`；文件不包含自身 SHA-256。旧 `performance_report` 字符串由
   结构化统计生成，原 helper 文本保留在私有 `performance.log`。
+  当前部署是扁平目录：install 的 common/libs 与 libs 中出现重复 basename 时，
+  即使字节相同也直接拒绝，不静默折叠；build-before 仅允许真正缺产物的空快照。
+  设备哈希输出中的重复路径/basename、缺项、额外项或异常格式也不能标 deployment verified。
 
 ### A/B 切换及恢复
 
@@ -182,6 +185,12 @@ pending、旧 stash ref 和唯一事务标识，防止在 stash 成功但 OID �
 SIGINT/TERM/timeout 会终止子进程组并尝试恢复，primary 与 recovery 错误分开；SIGKILL/断电
 不能执行 finally。下次发现未完成 receipt **直接拒绝**，不要盲删 receipt、不要反复 apply；
 先按 receipt/patch/stash OID 人工确认源码、index、branch、子模块与恢复状态。
+执行层写入的 `active_artifacts` / `patch_receipt` 指向最近一侧的恢复凭据；阶段保存会在
+相同 transaction_id 下合并这两个非空字符串字段，A 测量后、恢复中断时和 B 完成后均保留。
+阶段/stash/原身份仍由事务所有者控制，不全量合并磁盘内容；新事务不继承旧指针，运行中
+receipt 身份变化则拒绝覆盖。正常和恢复失败的最终归档 `ab_transaction.json` 均刷新执行指针；
+若刷新无法核验或写入，保留原 primary/recovery 错误并标记 execution_pointers_verified=false，
+不把上一侧的缓存指针冒充本侧恢复路径。
 
 A 无效则不跑 B；有效 native 加 host/trace warning 可以保留两侧数据。左右输出/log/CSV/trace
 使用不同目录（A/B 不采用单次的 `--output-dir` / `--trace` 覆盖），B 开始前再次验证输入。
@@ -196,6 +205,16 @@ not_comparable。两侧 `calls_per_iteration` 或调用名称/顺序构成不同
 不声称构建正确。即使 build/hash 有证据，`comparison.build_provenance.build_correctness` 仍是
 `unverified`：共享 build/cache 不是 hermetic clean build，不做因果或显著性结论；输出数值
 正确性始终 `not_verified`。repeat_full 是同进程 N 个生命周期，不是 N 个独立实验。
+
+内存比较还要求实际采样质量一致：`comparison.sampling_quality` 检查实际 interval 的
+median/max，以及 `duration_ms/(sample_count-1)` 的左右最大/最小比值。默认容差为 2，
+可用 `--sampling-quality-tolerance 1.5` 调整（必须有限且 >=1）。点数、跨度、实际统计须
+完整且一致（含统计值必须能由该点数产生，例如两点只有一个 interval，min/median/mean/max 必须相同）；
+跨度缩短且点数同步下降、密度相同，不会仅因总点数变少而拒绝。
+质量缺失/失配、覆盖状态不完整或不同，则内存行标 not_comparable，delta/percent=null，
+保留数值/原因，不影响独立可比的性能行。共同 `comparison.comparable` 不代表每个指标可比，
+应结合各行 status 和 sampling_quality。容差不能绕过缺失或非法元数据；两侧覆盖均为
+unverified 时仍明确警告，质量检查通过也不证明充分采样或连续时间峰值。
 
 ### 本地回归与依赖
 

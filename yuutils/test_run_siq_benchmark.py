@@ -124,6 +124,14 @@ class MeasurementTest(unittest.TestCase):
         self.assertIn('schema_version', result)
 
 
+def sampling_fixture(interval=5, count=21, coverage='unverified'):
+    return {'configured_period_ms': 5, 'sample_count': count, 'rows': count,
+            'duration_ms': interval * (count - 1), 'start_ms': 100,
+            'end_ms': 100 + interval * (count - 1),
+            'actual_interval_ms': dict(min=interval, median=interval, mean=interval, max=interval),
+            'coverage': {'status': coverage}}
+
+
 def valid_result(value=10):
     result = b.new_result()
     result.update({'status': 'ok', 'exit_code': 0, 'measurement_valid': True})
@@ -132,7 +140,7 @@ def valid_result(value=10):
         debug_mode=0, mode=2, actual_repeat=2, input_frames=1,
         input_digest='synthetic', instrumentation='memory_sampling')
     result['device'] = {'serial': 'fixture-device'}
-    result['sampling'] = {'configured_period_ms': 5}
+    result['sampling'] = sampling_fixture()
     result['source'] = dict(head='fixture-head', fingerprint=dict(index='i', staged='s', unstaged='u'), submodules={})
     result['deployment'] = {'sha256': {'siq_test': 'fixture-hash'}}
     result['experiment']['full_build_invocation_observed'] = True
@@ -229,6 +237,245 @@ class ComparisonTest(unittest.TestCase):
         left, right = valid_result(), valid_result()
         right['sampling']['configured_period_ms'] = 16
         self.assertFalse(b.compare_results(left, right)['comparable'])
+
+
+class SamplingQualityTest(unittest.TestCase):
+    def compare(self, sampling, tolerance=None):
+        left, right = valid_result(10), valid_result(1)
+        right['sampling'] = sampling
+        for side in (left, right):
+            side['memory'] = {component: {metric: b.memory_value(10, 'csv:fixture')
+                for metric in ('sampled_peak', 'sample_mean', 'getrusage_high_water')}
+                for component in b.MEMORY_COLUMNS}
+        result = (b.compare_results(left, right) if tolerance is None else
+                  b.compare_results(left, right, sampling_quality_tolerance=tolerance))
+        self.assertTrue(result['comparable'])  # Common checks, not every metric's status.
+        self.assertEqual(result['metrics'][0]['status'], 'ok')
+        self.assertEqual(result['metrics'][0]['delta_percent'], -90)
+        self.assertTrue(left['measurement_valid'] and right['measurement_valid'])
+        return result
+
+    def assert_memory_rejected(self, sampling, tolerance=None):
+        result = self.compare(sampling, tolerance)
+        rows = [r for r in result['metrics'] if r['metric'].startswith('memory.')]
+        self.assertTrue(all(r['status'] == 'not_comparable' for r in rows))
+        self.assertTrue(all(r['delta'] is None and r['delta_percent'] is None for r in rows))
+        self.assertTrue(all('sampling quality' in r['reason'] for r in rows))
+        self.assertFalse(result['sampling_quality']['comparable'])
+        self.assertEqual(result['sampling_quality']['status'], 'not_comparable')
+        return result
+
+    def test_same_config_actual_five_vs_hundred_ms_rejects_only_memory(self):
+        self.assert_memory_rejected(sampling_fixture(100))
+
+    def test_median_match_but_max_differs(self):
+        sampling = sampling_fixture()
+        sampling['actual_interval_ms'].update(min=0, max=25)
+        result = self.assert_memory_rejected(sampling)
+        self.assertTrue(result['sampling_quality']['checks']['median_interval_ratio'])
+        self.assertFalse(result['sampling_quality']['checks']['max_interval_ratio'])
+
+    def test_density_differs_despite_matching_median_and_max(self):
+        left, right = valid_result(), valid_result()
+        for side, mean in ((left, 7.5), (right, 45.5)):
+            side['sampling'] = sampling_fixture(mean)
+            side['sampling']['actual_interval_ms'].update(min=0, median=5, max=100)
+        result = b.compare_results(left, right)
+        self.assertFalse(result['sampling_quality']['checks']['effective_interval_ratio'])
+        self.assertTrue(result['sampling_quality']['checks']['median_interval_ratio'])
+        self.assertEqual(next(r for r in result['metrics'] if r['metric'] ==
+                             'memory.dma.sampled_peak')['status'], 'not_comparable')
+
+    def test_same_density_shorter_span_and_count_are_legal(self):
+        result = self.compare(sampling_fixture(count=5))
+        quality = result['sampling_quality']
+        self.assertTrue(quality['comparable'])
+        self.assertEqual(quality['evidence']['right']['effective_interval_ms'], 5)
+        self.assertEqual(quality['evidence']['right']['sample_count'], 5)
+        self.assertEqual(quality['tolerance'], 2.0)
+        self.assertTrue(any(r['status'] == 'ok' for r in result['metrics'] if r['metric'].startswith('memory.')))
+
+    def test_default_and_override_ratio_boundary(self):
+        self.assertTrue(self.compare(sampling_fixture(10))['sampling_quality']['comparable'])
+        self.assert_memory_rejected(sampling_fixture(10.001))
+        self.assertTrue(self.compare(sampling_fixture(15), 3)['sampling_quality']['comparable'])
+        self.assert_memory_rejected(sampling_fixture(15.001), 3)
+        self.assertTrue(self.compare(sampling_fixture(), 1)['sampling_quality']['comparable'])
+
+    def test_coverage_missing_invalid_incomplete_or_mismatched(self):
+        for status in (None, 'invalid', 'incomplete', 'failed', 'complete', 'unknown'):
+            sampling = sampling_fixture(coverage=status)
+            with self.subTest(status=status):
+                self.assert_memory_rejected(sampling, 1000)
+        for coverage in (None, [], {}):
+            sampling = sampling_fixture()
+            sampling['coverage'] = coverage
+            with self.subTest(coverage=coverage):
+                self.assert_memory_rejected(sampling)
+
+    def test_both_unverified_warn_and_both_complete_do_not_claim_peak_proof(self):
+        result = self.compare(sampling_fixture())
+        self.assertEqual(result['sampling_quality']['status'], 'warning')
+        self.assertTrue(any('coverage' in w and 'unverified' in w for w in result['sampling_quality']['warnings']))
+        left, right = valid_result(), valid_result()
+        for side in (left, right):
+            side['sampling']['coverage']['status'] = 'complete'
+        quality = b.compare_results(left, right)['sampling_quality']
+        self.assertTrue(quality['comparable'])
+        self.assertEqual(quality['status'], 'ok')
+        self.assertTrue(any('continuous' in w for w in quality['warnings']))
+
+
+    def test_missing_or_bad_quality_fields_cannot_be_overridden(self):
+        for field in ('sample_count', 'duration_ms', 'actual_interval_ms', 'coverage'):
+            sampling = sampling_fixture()
+            del sampling[field]
+            with self.subTest(missing=field):
+                self.assert_memory_rejected(sampling, 1000)
+        for field, values in (('sample_count', (None, 1, 0, 2.5, True, '21')),
+                              ('duration_ms', (None, 0, -1, float('nan'), float('inf'), '100')),
+                              ('rows', (0, 20, True)), ('end_ms', (0, float('nan')))):
+            for value in values:
+                sampling = sampling_fixture()
+                sampling[field] = value
+                with self.subTest(field=field, value=value):
+                    result = self.assert_memory_rejected(sampling, 1000)
+                    json.dumps(result['sampling_quality'], allow_nan=False)
+        for field in ('min', 'median', 'mean', 'max'):
+            for value in (None, -1, float('nan'), float('inf'), '5', True):
+                sampling = sampling_fixture()
+                sampling['actual_interval_ms'][field] = value
+                with self.subTest(interval_field=field, value=value):
+                    result = self.assert_memory_rejected(sampling, 1000)
+                    json.dumps(result['sampling_quality'], allow_nan=False)
+
+    def test_inconsistent_stats_and_missing_actual_statistics(self):
+        for stats in (None, [], {}, dict(min=6, median=5, mean=5, max=5),
+                      dict(min=0, median=0, mean=5, max=10),
+                      dict(min=0, median=5, mean=10, max=10),
+                      dict(min=0, median=5, mean=5, max=101)):
+            sampling = sampling_fixture()
+            sampling['actual_interval_ms'] = stats
+            with self.subTest(stats=stats):
+                self.assert_memory_rejected(sampling, 1000)
+
+    def test_interval_statistics_must_be_possible_for_sample_count(self):
+        for count in (2, 3):
+            sampling = sampling_fixture(count=count)
+            sampling['actual_interval_ms']['min'] = 0
+            for tolerance in (2, 1000):
+                with self.subTest(count=count, tolerance=tolerance):
+                    result = self.assert_memory_rejected(sampling, tolerance)
+                    self.assertFalse(result['sampling_quality']['evidence']['right']['checks']['consistent_intervals'])
+
+    def test_one_interval_and_two_interval_statistics_can_be_valid(self):
+        self.assertTrue(self.compare(sampling_fixture(count=2))['sampling_quality']['comparable'])
+        sampling = sampling_fixture(interval=2.5, count=3)
+        sampling['actual_interval_ms'].update(min=0, max=5)
+        self.assertTrue(self.compare(sampling)['sampling_quality']['comparable'])
+
+    def test_cli_default_valid_boundary_and_invalid_tolerance_json(self):
+        self.assertEqual(b.build_parser().parse_args([]).sampling_quality_tolerance, 2.0)
+        for value in ('1', '3.5'):
+            args = b.build_parser().parse_args(['--sampling-quality-tolerance', value])
+            self.assertEqual(args.sampling_quality_tolerance, float(value))
+        for value in ('nan', 'inf', '-inf', '0.9', '0', 'bad'):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(value=value), contextlib.redirect_stdout(stdout), \
+                    contextlib.redirect_stderr(stderr):
+                self.assertEqual(b.main(['--json', '--sampling-quality-tolerance=' + value]), 1)
+                self.assertEqual(json.loads(stdout.getvalue())['status'], 'failed')
+        for value in (float('nan'), float('inf'), 0.9, True, None):
+            with self.subTest(direct=value), self.assertRaises(b.BenchmarkError):
+                b.compare_results(valid_result(), valid_result(), value)
+
+
+class DeploymentSafetyTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        self.install = self.repo / 'siq3_install/release/C_SDK'
+        self.receipt = self.repo / 'deployment.json'
+        self.command = 'cd /fixture; ./siq_test -n 1 -p input'
+        env = {'_BENCH_REPO_ROOT': str(self.repo), '_BENCH_DEPLOYMENT': str(self.receipt)}
+        self.env = mock.patch.dict(os.environ, env)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.input = mock.patch.object(b, 'remote_input_manifest', return_value={})
+        self.input.start()
+        self.addCleanup(self.input.stop)
+
+    def payload(self):
+        files = [self.install / 'bin/siq_test', self.install / 'libs/arm64-v8a/libfixture.so']
+        for path in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'synthetic ' + path.name.encode())
+        return files
+
+    def hashes(self, files):
+        return '\n'.join(b.file_sha256(p) + '  /fixture/' + p.name for p in files) + '\n'
+
+    def test_local_collision_rejected_before_adb_even_for_identical_bytes(self):
+        files = self.payload()
+        duplicate = self.install / 'common/libs/arm64-v8a/libfixture.so'
+        duplicate.parent.mkdir(parents=True)
+        for content in (b'different fixture', files[1].read_bytes()):
+            duplicate.write_bytes(content)
+            with self.subTest(identical=content == files[1].read_bytes()):
+                with self.assertRaises(b.BenchmarkError):
+                    b.build_artifact_snapshot(self.repo)
+                with mock.patch.object(b.subprocess, 'run') as adb:
+                    with self.assertRaises(b.BenchmarkError):
+                        b.verify_deployment('fixture-adb', [], self.command)
+                    adb.assert_not_called()
+                self.assertFalse(self.receipt.exists())
+
+    def test_empty_snapshot_and_missing_category(self):
+        self.assertEqual(b.build_artifact_snapshot(self.repo), {})
+        with self.assertRaises(b.MissingDeploymentArtifacts):
+            b.deployment_artifacts(self.repo)
+
+    def test_snapshot_does_not_swallow_other_benchmark_errors(self):
+        with mock.patch.object(b, 'deployment_artifacts', side_effect=b.BenchmarkError('fixture failure')):
+            with self.assertRaises(b.BenchmarkError):
+                b.build_artifact_snapshot(self.repo)
+
+    def test_unique_payload_shape_and_star_hash_marker(self):
+        files = self.payload()
+        responses = [subprocess.CompletedProcess([], 0, self.hashes(files).replace('  /', ' */'), ''),
+                     subprocess.CompletedProcess([], 0, '1\n', '')]
+        with mock.patch.dict(os.environ, {'_BENCH_INPUT_DIR': ''}), \
+                mock.patch.object(b.subprocess, 'run', side_effect=responses):
+            b.verify_deployment('fixture-adb', [], self.command)
+        payload = json.loads(self.receipt.read_text())
+        self.assertEqual(payload['sha256'], {p.name: b.file_sha256(p) for p in files})
+        self.assertEqual(set(payload['local_build_artifacts']), {p.name for p in files})
+        self.assertEqual(payload['invocations'], 1)
+
+    def test_remote_duplicate_and_malformed_hashes_cannot_verify(self):
+        files = self.payload()
+        normal = self.hashes(files)
+        bad = (normal + normal.splitlines()[0] + '\n',
+               normal + b.file_sha256(files[1]) + '  /other/libfixture.so\n',
+               normal.replace('/fixture/libfixture.so', '/other/libfixture.so'),
+               normal.replace('/fixture/libfixture.so', '/fixture/nested/../libfixture.so'),
+               normal.replace('/fixture/libfixture.so', 'libfixture.so'),
+               normal.replace(b.file_sha256(files[0]), 'malformed'),
+               normal + 'malformed line\n', normal + '\n',
+               normal.splitlines()[0] + '\n',
+               normal + '0' * 64 + '  /fixture/extra.so\n')
+        for index, output in enumerate(bad):
+            receipt = self.repo / ('bad-deployment-%d.json' % index)
+            responses = [subprocess.CompletedProcess([], 0, output, ''),
+                         subprocess.CompletedProcess([], 0, '1\n', '')]
+            with self.subTest(index=index), mock.patch.dict(os.environ,
+                    {'_BENCH_INPUT_DIR': '', '_BENCH_DEPLOYMENT': str(receipt)}), \
+                    mock.patch.object(b.subprocess, 'run', side_effect=responses) as adb:
+                with self.assertRaises(b.BenchmarkError):
+                    b.verify_deployment('fixture-adb', [], self.command)
+                self.assertEqual(adb.call_count, 1)
+                self.assertFalse(receipt.exists())
 
 
 def lifecycle_log(rounds, mode=1, function='ref', tail=''):
@@ -387,6 +634,83 @@ class PerformanceCoverageTest(unittest.TestCase):
         metric = b.structured_performance(text, 'ref', 2)['ref']
         self.assertEqual(metric['status'], 'unverified')
         self.assertIsNone(metric['iteration_counts'])
+
+
+class TransactionPointerTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        self.receipt = self.repo / 'active.json'
+        with mock.patch.object(b, 'git_text', return_value=''):
+            self.tx = b.ABTransaction(self.repo, self.receipt, {'head': 'fixture-head'}, 'target')
+
+    def execution_pointers(self, label='left', **extras):
+        disk = json.loads(self.receipt.read_text())
+        disk.update(active_artifacts=str(self.repo / label),
+                    patch_receipt=str(self.repo / label / 'source_patch.json'), **extras)
+        b.atomic_json(self.receipt, disk)
+        return disk
+
+    def test_save_after_a_retains_execution_owned_pointers(self):
+        self.tx.stage('left_running')
+        disk = self.execution_pointers()
+        self.tx.data['left_artifacts'] = disk['active_artifacts']
+        self.tx.save()
+        saved = json.loads(self.receipt.read_text())
+        for field in ('active_artifacts', 'patch_receipt'):
+            self.assertEqual(saved[field], disk[field])
+            self.assertEqual(self.tx.data[field], disk[field])
+        self.assertEqual(saved['state'], 'left_running')
+
+    def test_merge_whitelist_does_not_adopt_disk_state_stash_or_original(self):
+        self.tx.data['stash_oid'] = 'owned-stash'
+        disk = self.execution_pointers(state='complete', stash_oid='other-stash', original={'head': 'other'},
+                                       foreign_field='must not copy')
+        self.tx.stage('restoring_source')
+        saved = json.loads(self.receipt.read_text())
+        self.assertEqual(saved['state'], 'restoring_source')
+        self.assertEqual(saved['stash_oid'], 'owned-stash')
+        self.assertEqual(saved['original']['head'], 'fixture-head')
+        self.assertNotIn('foreign_field', saved)
+        self.assertEqual(saved.get('patch_receipt'), disk['patch_receipt'])
+
+    def test_new_transaction_never_inherits_previous_id_pointers(self):
+        old = self.execution_pointers(state='complete')
+        with mock.patch.object(b, 'git_text', return_value=''):
+            tx = b.ABTransaction(self.repo, self.receipt, {'head': 'new'}, 'new-target')
+        saved = json.loads(self.receipt.read_text())
+        self.assertNotEqual(saved['transaction_id'], old['transaction_id'])
+        self.assertEqual(saved['transaction_id'], tx.data['transaction_id'])
+        self.assertNotIn('active_artifacts', saved)
+        self.assertNotIn('patch_receipt', saved)
+
+    def test_wrong_id_fails_closed_and_preserves_original_receipt(self):
+        disk = self.execution_pointers(transaction_id='different-transaction')
+        with self.assertRaises(b.BenchmarkError):
+            self.tx.stage('restoring_source')
+        self.assertEqual(self.tx.data['state'], 'prepared')
+        self.assertEqual(json.loads(self.receipt.read_text()), disk)
+
+    def test_non_string_controlled_pointer_fails_without_overwrite(self):
+        for value in (None, '', 42, [], {}):
+            disk = self.execution_pointers()
+            disk['patch_receipt'] = value
+            b.atomic_json(self.receipt, disk)
+            with self.subTest(value=value), self.assertRaises(b.BenchmarkError):
+                self.tx.save()
+            self.assertEqual(json.loads(self.receipt.read_text()), disk)
+
+    def test_atomic_write_failure_reverts_memory_stage_and_keeps_disk_pointers(self):
+        self.tx.stage('left_running')
+        disk = self.execution_pointers()
+        with mock.patch.object(b.os, 'replace', side_effect=OSError('fixture write failure')):
+            with self.assertRaises(OSError):
+                self.tx.stage('restoring_source')
+        self.assertEqual(self.tx.data['state'], 'left_running')
+        self.assertEqual(json.loads(self.receipt.read_text()), disk)
+        self.tx.stage('restoring_source')
+        self.assertEqual(json.loads(self.receipt.read_text()).get('patch_receipt'), disk['patch_receipt'])
 
 
 class GitFixtureTest(unittest.TestCase):
@@ -912,7 +1236,8 @@ class GitFixtureTest(unittest.TestCase):
         self.assertTrue(result['measurement_valid'])
         self.assertEqual(result['status'], 'warning')
         self.assertEqual(result['exit_code'], 0)
-        self.assertEqual(result['warnings'], ['transaction stash retained: ' + reason + '; inspect receipt for the exact OID'])
+        self.assertEqual(result['warnings'], result['comparison']['sampling_quality']['warnings'] +
+                         ['transaction stash retained: ' + reason + '; inspect receipt for the exact OID'])
         self.assertIn(receipt['stash_oid'], self.git(self.repo, 'stash', 'list', '--format=%H'))
         self.assertFalse(any(args[0] in ('update-ref', 'reflog') or args[:2] == ('stash', 'drop') for args in commands))
 
@@ -1302,6 +1627,125 @@ class GitFixtureTest(unittest.TestCase):
         self.assertIn('unfinished', json.loads(stdout.getvalue())['primary_error']['message'])
         self.assertEqual(b.git_head(self.repo), self.old)
         self.assertEqual(json.loads(self.active.read_text()), receipt)
+
+    def pointer_single(self, args):
+        args.work_dir.mkdir(parents=True, exist_ok=True)
+        patch = args.work_dir / 'source_patch.json'
+        b.atomic_json(patch, {'synthetic': True})
+        disk = json.loads(args._active_path.read_text())
+        disk.update(active_artifacts=str(args.work_dir), patch_receipt=str(patch))
+        b.atomic_json(args._active_path, disk)
+        result = valid_result()
+        result['_work_dir'] = str(args.work_dir)
+        return result
+
+    def test_restoring_source_interruption_keeps_left_pointer_on_disk_and_archive(self):
+        real = b.checkout
+        def interrupt(repo, oid, branch=None):
+            if oid == self.current:
+                raise KeyboardInterrupt('fixture recovery interruption')
+            return real(repo, oid, branch)
+        with mock.patch.object(b, 'execute_single', self.pointer_single), \
+                mock.patch.object(b, 'checkout', interrupt):
+            result = b.run_ab(self.args(), self.active)
+        disk = json.loads(self.active.read_text())
+        self.assertEqual(disk['state'], 'restoring_source')
+        self.assertEqual(result['recovery_error']['type'], 'Interrupted')
+        self.assertEqual(disk.get('active_artifacts'), disk['left_artifacts'])
+        self.assertTrue(Path(disk['patch_receipt']).is_file())
+        archived = json.loads(Path(result['artifacts']['transaction']['path']).read_text())
+        self.assertEqual(archived['patch_receipt'], disk['patch_receipt'])
+
+    def test_right_complete_and_archive_retain_current_execution_pointer(self):
+        with mock.patch.object(b, 'execute_single', self.pointer_single):
+            result = b.run_ab(self.args(), self.active)
+        disk = json.loads(self.active.read_text())
+        archived = json.loads(Path(result['artifacts']['transaction']['path']).read_text())
+        self.assertTrue(result['measurement_valid'])
+        self.assertEqual(disk['state'], 'complete')
+        self.assertEqual(disk.get('active_artifacts'), disk['right_artifacts'])
+        self.assertNotEqual(disk['left_artifacts'], disk['right_artifacts'])
+        self.assertEqual(disk['patch_receipt'], str(Path(disk['right_artifacts']) / 'source_patch.json'))
+        self.assertEqual(archived, disk)
+        self.assertTrue(Path(disk['patch_receipt']).is_file())
+
+    def test_right_recovery_failure_archive_retains_right_pointer(self):
+        failure = {'type': 'FixtureRecovery', 'message': 'right restoration failed'}
+        def run(args):
+            result = self.pointer_single(args)
+            if args.work_dir.name == 'right':
+                result['recovery_error'] = failure
+                result['measurement_valid'] = False
+            return result
+        with mock.patch.object(b, 'execute_single', run):
+            result = b.run_ab(self.args(), self.active)
+        disk = json.loads(self.active.read_text())
+        archived = json.loads(Path(result['artifacts']['transaction']['path']).read_text())
+        self.assertFalse(result['measurement_valid'])
+        self.assertEqual(result['recovery_error'], failure)
+        self.assertEqual(disk['state'], 'right_running')
+        self.assertEqual(disk['active_artifacts'], disk['right_artifacts'])
+        self.assertEqual(disk['patch_receipt'], str(Path(disk['right_artifacts']) / 'source_patch.json'))
+        self.assertEqual(archived, disk)
+
+    def test_archive_refresh_failure_does_not_mask_errors_or_reuse_left_pointer(self):
+        real_save = b.ABTransaction.save
+        failure = {'type': 'FixtureRecovery', 'message': 'right restoration failed'}
+        primary = {'type': 'FixturePrimary', 'message': 'right execution failed'}
+        for mode in ('write_error', 'wrong_id', 'interrupt'):
+            def run(args):
+                result = self.pointer_single(args)
+                if args.work_dir.name == 'right':
+                    result.update(recovery_error=failure, primary_error=primary, measurement_valid=False)
+                    if mode == 'wrong_id':
+                        disk = json.loads(self.active.read_text())
+                        disk['transaction_id'] = 'foreign-transaction'
+                        b.atomic_json(self.active, disk)
+                return result
+            def save(tx, initial=False):
+                if mode in ('write_error', 'interrupt') and tx.data['state'] == 'right_running' and tx.data['recovery_error']:
+                    if mode == 'interrupt':
+                        raise KeyboardInterrupt('fixture final receipt interruption')
+                    raise OSError('fixture final receipt write failure')
+                return real_save(tx, initial=initial)
+            args = self.args()
+            args.work_dir = self.base / ('archive-' + mode)
+            with self.subTest(mode=mode), mock.patch.object(b, 'execute_single', run), \
+                    mock.patch.object(b.ABTransaction, 'save', save):
+                result = b.run_ab(args, self.active)
+            archived = json.loads(Path(result['artifacts']['transaction']['path']).read_text())
+            disk = json.loads(self.active.read_text())
+            self.assertEqual(result['primary_error'], primary)
+            self.assertEqual(result['recovery_error'], failure)
+            self.assertEqual(result['exit_code'], 130 if mode == 'interrupt' else 1)
+            self.assertEqual(result['status'], 'interrupted' if mode == 'interrupt' else 'failed')
+            self.assertFalse(archived['execution_pointers_verified'])
+            self.assertNotIn('active_artifacts', archived)
+            self.assertNotIn('patch_receipt', archived)
+            self.assertIn('receipt_write_error', archived)
+            self.assertEqual(disk['active_artifacts'], archived['right_artifacts'])
+            self.assertEqual(disk['state'], 'right_running')
+            if mode == 'wrong_id':
+                self.assertEqual(disk['transaction_id'], 'foreign-transaction')
+
+    def test_orchestrator_passes_sampling_tolerance_and_reports_quality_warning(self):
+        for tolerance, interval, comparable in ((3, 15, True), (2, 100, False)):
+            calls = []
+            def run(args):
+                result = valid_result(10 if not calls else 1)
+                result['sampling'] = sampling_fixture(5 if not calls else interval)
+                calls.append(args)
+                return result
+            args = self.args()
+            args.sampling_quality_tolerance = tolerance
+            with self.subTest(tolerance=tolerance), mock.patch.object(b, 'execute_single', run):
+                result = b.run_ab(args, self.active)
+                quality = result['comparison']['sampling_quality']
+                self.assertEqual(quality['tolerance'], tolerance)
+                self.assertEqual(quality['comparable'], comparable)
+                self.assertTrue(result['measurement_valid'])
+                self.assertEqual(result['comparison']['metrics'][0]['status'], 'ok')
+                self.assertTrue(any('sampling coverage is unverified' in w for w in result['warnings']))
 
     def test_orchestrator_restores_dirty_before_right_and_isolates_artifacts(self):
         (self.repo / 'source').write_text('staged\n')

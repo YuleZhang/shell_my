@@ -436,6 +436,15 @@ def describe_manifest_diff(
     return "; ".join(details)
 
 
+def unique_deployment_basenames(files):
+    seen = set()
+    for path in files:
+        if path.name in seen:
+            raise BenchmarkError('deployment artifact basename collision; flat deployment is ambiguous')
+        seen.add(path.name)
+    return files
+
+
 def deployment_artifacts(repo: Path, abi: str = "arm64-v8a") -> list[Path]:
     """Local artifacts that must match the device, taken from the build that just ran.
 
@@ -460,21 +469,42 @@ def deployment_artifacts(repo: Path, abi: str = "arm64-v8a") -> list[Path]:
         libs = [p for sub in (f"common/libs/{abi}", f"libs/{abi}")
                 for p in sorted((install / sub).glob("*.so"))]
         if libs:
-            return [binary, *libs]
+            return unique_deployment_basenames([binary, *libs])
     local_dir = repo / "scripts/libs" / abi
     files = [local_dir / "siq_test", *sorted(local_dir.glob("*.so"))]
     if not files[0].is_file() or len(files) == 1:
-        raise RuntimeError("cannot verify deployed siq_test and shared libraries")
-    return files
+        raise MissingDeploymentArtifacts("cannot verify deployed siq_test and shared libraries")
+    return unique_deployment_basenames(files)
 
 
 def build_artifact_snapshot(repo):
     try:
         files = deployment_artifacts(repo)
-    except RuntimeError:
+    except MissingDeploymentArtifacts:
         files = []
     return {p.name: {'sha256': file_sha256(p), 'size': p.stat().st_size,
                      'mtime_ns': p.stat().st_mtime_ns} for p in files}
+
+
+def parse_deployment_hashes(output, remote_dir, files):
+    expected = {remote_dir + '/' + p.name for p in files}
+    hashes = {}
+    paths = set()
+    for line in output.splitlines():
+        match = re.fullmatch(r'([0-9a-fA-F]{64})[ \t]+\*?(.+)', line)
+        if not match:
+            raise BenchmarkError('malformed deployment hash output')
+        digest, path = match.groups()
+        name = PurePosixPath(path).name
+        if path in paths or name in hashes:
+            raise BenchmarkError('duplicate deployment hash path or basename')
+        if path not in expected:
+            raise BenchmarkError('unexpected deployment hash path; flat deployment required')
+        paths.add(path)
+        hashes[name] = digest.lower()
+    if paths != expected:
+        raise BenchmarkError('missing deployment hashes')
+    return hashes
 
 
 def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
@@ -492,12 +522,10 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
         [adb, *adb_options, "shell", "sha256sum " + " ".join(shlex.quote(remote_dir + '/' + p.name) for p in files)],
         capture_output=True, text=True, timeout=60, check=True,
     )
-    remote_hashes = {Path(parts[1].lstrip('*')).name: parts[0] for line in result.stdout.splitlines()
-                     if len(parts := line.split(maxsplit=1)) == 2}
+    remote_hashes = parse_deployment_hashes(result.stdout, remote_dir, files)
     hashes = {p.name: file_sha256(p) for p in files}
     if hashes != remote_hashes:
-        raise RuntimeError("deployed binary/library hashes differ from this build: " +
-                           ", ".join(name for name, digest in hashes.items() if remote_hashes.get(name) != digest))
+        raise BenchmarkError('deployed binary/library hashes differ from this build')
     match = SIQ_COMMAND_RE.search(command)
     tokens = shlex.split(match.group('command'))
     frames = int(tokens[tokens.index('-n') + 1])
@@ -1428,6 +1456,16 @@ def parse_run_command(args: argparse.Namespace) -> tuple[Path | None, list[str] 
     return run_script, tokens, Path(args.output_dir)
 
 
+def sampling_quality_tolerance_value(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise BenchmarkError('sampling quality tolerance must be finite and >= 1') from None
+    if isinstance(value, bool) or not math.isfinite(parsed) or parsed < 1:
+        raise BenchmarkError('sampling quality tolerance must be finite and >= 1')
+    return parsed
+
+
 class ResultArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         # argparse may include arbitrary argument values in its error text.
@@ -1508,6 +1546,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=1800,
         help="Maximum seconds for each adb/build/run helper command (default: 1800).",
     )
+    parser.add_argument('--sampling-quality-tolerance', type=sampling_quality_tolerance_value, default=2.0,
+                        help='Maximum A/B actual sampling interval ratio for memory comparison (finite >= 1; default: 2).')
     parser.add_argument('--json', action='store_true', help='Emit exactly one versioned JSON result on stdout.')
     parser.add_argument('--ab-test-commit', '--ab_test_commit', metavar='COMMIT',
                         help='Compare target (left) with restored current worktree (right).')
@@ -2189,6 +2229,10 @@ class BenchmarkError(RuntimeError):
     """Messages constructed by this module, safe for public diagnostics."""
 
 
+class MissingDeploymentArtifacts(BenchmarkError):
+    """Build-before may legitimately have no executable/library payload yet."""
+
+
 def safe_error(exc):
     if isinstance(exc, BenchmarkError):
         return {'type': type(exc).__name__, 'message': str(exc)}
@@ -2559,9 +2603,22 @@ class ABTransaction:
                      'original': original, 'target': target, 'stash_oid': None,
                      'stash_previous': git_text(repo, 'rev-parse', '--verify', 'refs/stash', optional=True) or None,
                      'primary_error': None, 'recovery_error': None, 'commands_policy': 'no force/reset/clean'}
-        self.save()
+        self.save(initial=True)
 
-    def save(self):
+    def save(self, initial=False):
+        if not initial:
+            disk = json.loads(self.path.read_text())
+            if (disk.get('kind') != self.data['kind'] or
+                    disk.get('transaction_id') != self.data['transaction_id']):
+                raise BenchmarkError('transaction receipt identity changed; refusing to overwrite')
+            pointers = {}
+            for field in ('active_artifacts', 'patch_receipt'):
+                if field in disk:
+                    value = disk[field]
+                    if not isinstance(value, str) or not value:
+                        raise BenchmarkError('invalid execution recovery pointer; receipt retained')
+                    pointers[field] = value
+            self.data.update(pointers)
         atomic_json(self.path, self.data)
 
     def stage(self, state):
@@ -2691,7 +2748,86 @@ def source_identity_evidence(left, right):
     return 'different' if difference else 'unverified'
 
 
-def compare_results(left, right):
+def sampling_quality_evidence(sampling):
+    sampling = sampling if isinstance(sampling, dict) else {}
+    def finite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:
+            return None
+    count, duration = finite(sampling.get('sample_count')), finite(sampling.get('duration_ms'))
+    count_valid = type(count) is int and count >= 2
+    duration_valid = duration is not None and duration > 0
+    effective = duration / (count - 1) if count_valid and duration_valid else None
+    effective = finite(effective)
+    actual = sampling.get('actual_interval_ms')
+    actual = actual if isinstance(actual, dict) else {}
+    intervals = {key: finite(actual.get(key)) for key in ('min', 'median', 'mean', 'max')}
+    interval_valid = (all(v is not None for v in intervals.values()) and
+                      intervals['min'] >= 0 and all(intervals[k] > 0 for k in ('median', 'mean', 'max')))
+    consistent = False
+    if interval_valid and effective is not None and effective > 0:
+        low, high = intervals['min'], intervals['max']
+        consistent = (low <= intervals['median'] <= high and low <= intervals['mean'] <= high and
+                      high <= duration and math.isclose(intervals['mean'], effective, rel_tol=1e-9, abs_tol=1e-9))
+        if consistent:
+            if count == 2:
+                consistent = len(set(intervals.values())) == 1
+            else:
+                # At least one observed interval realizes each extremum.
+                lower = high + (count - 2) * low
+                upper = low + (count - 2) * high
+                consistent = ((duration >= lower or math.isclose(duration, lower, rel_tol=1e-9, abs_tol=1e-9)) and
+                              (duration <= upper or math.isclose(duration, upper, rel_tol=1e-9, abs_tol=1e-9)))
+                if count == 3:
+                    consistent = consistent and math.isclose(intervals['median'], intervals['mean'],
+                                                             rel_tol=1e-9, abs_tol=1e-9)
+    rows_valid = ('rows' not in sampling or
+                  (type(sampling['rows']) is int and count_valid and sampling['rows'] == count))
+    span_valid = True
+    if 'start_ms' in sampling or 'end_ms' in sampling:
+        start, end = finite(sampling.get('start_ms')), finite(sampling.get('end_ms'))
+        span_valid = (start is not None and end is not None and duration_valid and
+                      math.isclose(end - start, duration, rel_tol=1e-9, abs_tol=1e-9))
+    coverage = sampling.get('coverage')
+    status = coverage.get('status') if isinstance(coverage, dict) else None
+    status = status if isinstance(status, str) else None
+    checks = {'sample_count': count_valid, 'duration': duration_valid,
+              'actual_intervals': interval_valid, 'consistent_intervals': consistent,
+              'rows': rows_valid, 'timestamp_span': span_valid}
+    return {'sample_count': count, 'duration_ms': duration, 'effective_interval_ms': effective,
+            'actual_interval_ms': intervals, 'coverage_status': status, 'checks': checks}
+
+
+def sampling_quality(left, right, tolerance=2.0):
+    tolerance = sampling_quality_tolerance_value(tolerance)
+    evidence = {name: sampling_quality_evidence(side) for name, side in (('left', left), ('right', right))}
+    le, re = evidence['left'], evidence['right']
+    checks = {name + '_metadata': all(side['checks'].values()) for name, side in evidence.items()}
+    coverage = le['coverage_status'], re['coverage_status']
+    checks['coverage'] = coverage[0] in ('complete', 'unverified') and coverage[0] == coverage[1]
+    ratios = {}
+    for name, lv, rv in (('median_interval', le['actual_interval_ms']['median'], re['actual_interval_ms']['median']),
+                         ('max_interval', le['actual_interval_ms']['max'], re['actual_interval_ms']['max']),
+                         ('effective_interval', le['effective_interval_ms'], re['effective_interval_ms'])):
+        ratio = max(lv, rv) / min(lv, rv) if checks['left_metadata'] and checks['right_metadata'] else None
+        ratios[name] = ratio if ratio is not None and math.isfinite(ratio) else None
+        checks[name + '_ratio'] = ratios[name] is not None and ratios[name] <= tolerance
+    evidence['max_min_ratios'] = ratios
+    comparable = all(checks.values())
+    warnings = ['sampling quality checks do not prove continuous-time peaks or sufficient sampling']
+    if coverage == ('unverified', 'unverified'):
+        warnings.append('sampling coverage is unverified on both sides; comparison is descriptive only')
+    if not comparable:
+        warnings.append('memory comparison refused: sampling quality metadata, coverage or interval ratio failed')
+    return {'comparable': comparable, 'status': 'not_comparable' if not comparable else
+                'warning' if coverage == ('unverified', 'unverified') else 'ok',
+            'checks': checks, 'evidence': evidence, 'tolerance': tolerance, 'warnings': warnings}
+
+
+def compare_results(left, right, sampling_quality_tolerance=2.0):
     checks = {}
     hard = ('project', 'adapter', 'platform', 'debug_mode', 'mode', 'actual_repeat',
             'input_frames', 'input_digest', 'instrumentation')
@@ -2716,6 +2852,7 @@ def compare_results(left, right):
                         'build_correctness': 'unverified'}
     checks['measurement'] = left['measurement_valid'] and right['measurement_valid']
     base = all(checks.values())
+    quality = sampling_quality(left.get('sampling'), right.get('sampling'), sampling_quality_tolerance)
     rows = []
     def add(name, lv, rv, comparable, reason=None):
         status = 'missing' if lv is None or rv is None else 'ok' if comparable else 'not_comparable'
@@ -2748,11 +2885,13 @@ def compare_results(left, right):
         for metric in metrics:
             lm = left['memory'].get(component, {}).get(metric, {})
             rm = right['memory'].get(component, {}).get(metric, {})
-            compatible = base and lm.get('unit') == rm.get('unit') and lm.get('source') == rm.get('source')
+            compatible = (base and quality['comparable'] and lm.get('unit') == rm.get('unit') and
+                          lm.get('source') == rm.get('source'))
             add('memory.' + component + '.' + metric, lm.get('value'), rm.get('value'), compatible,
+                'sampling quality metadata, coverage or interval ratio failed' if not quality['comparable'] else
                 'missing data or configuration/memory unit/column source mismatch')
     return {'direction': 'right_minus_left', 'comparable': base, 'checks': checks, 'metrics': rows,
-            'build_provenance': build_provenance,
+            'build_provenance': build_provenance, 'sampling_quality': quality,
             'interpretation': 'ordered A then B observational comparison; shared build provenance unverified; no causal/significance claim'}
 
 
@@ -2829,7 +2968,7 @@ def run_ab(args, active):
             result['primary_error'] = right['primary_error']
             result['recovery_error'] = right['recovery_error']
             verify_original(repo, original)
-            result['comparison'] = compare_results(left, right)
+            result['comparison'] = compare_results(left, right, getattr(args, 'sampling_quality_tolerance', 2.0))
         except BaseException as exc:
             result['recovery_error'] = result['recovery_error'] or safe_error(exc)
     result['left'] = public_result(left) if left else None
@@ -2855,6 +2994,11 @@ def run_ab(args, active):
                                     if len(states) == 2 and all(s == success for s in states) else 'incomplete')
     result['warnings'] = [side['role'] + ': ' + warning for side in (left, right) if side
                           for warning in side.get('warnings', [])]
+    if result.get('comparison'):
+        quality = result['comparison']['sampling_quality']
+        result['warnings'].extend(quality['warnings'])
+        if quality['status'] != 'ok' and result['status'] == 'ok':
+            result['status'] = 'warning'
     result['experiment']['elapsed_seconds'] = time.monotonic() - benchmark_started
     if tx.data['stash_oid'] and not tx.data.get('stash_dropped'):
         reason = tx.data.get('stash_retained_reason', 'restoration unverified; no stash cleanup attempted')
@@ -2862,8 +3006,27 @@ def run_ab(args, active):
         if result['status'] == 'ok':
             result['status'] = 'warning'
     tx.data.update({'primary_error': result['primary_error'], 'recovery_error': result['recovery_error']})
-    if not result['recovery_error']:
-        tx.stage('complete')
+    try:
+        if not result['recovery_error']:
+            tx.stage('complete')
+        else:
+            tx.save()  # B failure still needs the execution layer's latest recovery pointers.
+    except BaseException as exc:
+        tx.data['receipt_write_error'] = safe_error(exc)
+        result['recovery_error'] = result['recovery_error'] or tx.data['receipt_write_error']
+        tx.data['recovery_error'] = result['recovery_error']
+        for field in ('active_artifacts', 'patch_receipt'):
+            tx.data.pop(field, None)
+        tx.data['execution_pointers_verified'] = False
+        result['measurement_valid'] = False
+        if isinstance(exc, KeyboardInterrupt):
+            result['status'], result['exit_code'] = 'interrupted', 130
+        else:
+            if result['status'] != 'interrupted':
+                result['status'] = 'failed'
+            result['exit_code'] = result['exit_code'] or 1
+        result['phase'] = 'recovery_failed'
+        result['validity']['source_restore'] = 'failed'
     atomic_json(work / 'ab_transaction.json', tx.data)
     result['artifacts']['transaction'] = artifact_info(work / 'ab_transaction.json')
     save_result(result)
