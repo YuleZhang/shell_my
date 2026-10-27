@@ -29,10 +29,12 @@ export class RecoveryGate {
     const last = [...(event.messages || [])].reverse().find(m => m.role === 'assistant');
     if (!last || last.stopReason !== 'error' || typeof last.errorMessage !== 'string') return;
     // Only the last native error, never transcript/terminal/history matching.
-    // Explicit Key exhaustion wins over any transient text in the same error.
+    // Explicit Key or budget-pool exhaustion wins over transient text.
     if (/OpenAI\s+API\s+error\s*\(402\)/i.test(last.errorMessage) &&
         (/API\s+Key\s+quota\s+has\s+been\s+exhausted\b/i.test(last.errorMessage) ||
-         /\bapi_key_quota_exhausted\b/i.test(last.errorMessage))) {
+         /\b(?:api_key_quota_exhausted|quota_unavailable|insufficient_quota)\b/i.test(last.errorMessage) ||
+         /No\s+budget\s+pool\s+with\s+available\s+quota\s+could\s+be\s+selected\b/i.test(last.errorMessage) ||
+         /No\s+budget\s+pool\s+bound\s+to\s+this\s+API\s+Key\s+currently\s+has\s+available\s+quota\b/i.test(last.errorMessage))) {
       this.candidate = 'quota-exhausted';
     } else if (/Our\s+servers\s+are\s+currently\s+overloaded\.\s*Please\s+try\s+again\s+later\./i.test(last.errorMessage)) {
       this.candidate = 'overload';

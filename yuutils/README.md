@@ -297,10 +297,13 @@ Linux `/proc`、Unix socket/SO_PEERCRED 和已安装的 native Step 扩展接口
   `Rate limit exceeded`；内置 retry / autopilot 耗尽且原生回合 settled 后，按上述安全规则
   自动发送 `continue`。不再用 wrapper CLI 的 `usage` 余额作为恢复门槛，也不访问凭据。
   每个新失败回合均可恢复，包括相同的 429，但距离上次提交至少 60 秒；同一候选不重复发送。
-- **402 Key 配额耗尽禁止恢复**：同一错误中 HTTP 402 且包含
-  `API Key quota has been exhausted` 或 `api_key_quota_exhausted`，返回 `quota-exhausted`；
+- **402 配额 / 预算池额度不可用禁止恢复**：同一错误中 HTTP 402 且包含
+  `API Key quota has been exhausted`、`api_key_quota_exhausted`、`quota_unavailable` 或
+  `insufficient_quota`，或明确说明无可用预算池（`No budget pool with available quota could be selected` /
+  `No budget pool bound to this API Key currently has available quota`），返回 `quota-exhausted`；
   即使混有过载/限流文本，也绝不发送 `continue`。兼容换行与错误示例中的非标准 JSON。
-  其他未知错误没有恢复候选；这不是把所有 402 都视为 Key 配额耗尽。
+  其他未知错误没有恢复候选；这不是把所有 402 都视为配额耗尽。
+  额度恢复后新的失败回合会重新分类，不因旧额度错误永久禁用恢复。
   此限制控制 watcher 的自动继续，不修改 StepCode 内部已开始的 provider / autopilot 重试。
 - `submitted-unconfirmed` 只表示已经调用发送 API，不表示模型收到或完成；调用前消费候选，
   发送抛错/超时/重复请求不重发，不绕过 agent 的审批。

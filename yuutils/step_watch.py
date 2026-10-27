@@ -26,7 +26,11 @@ OVERLOAD_RETRY_FAILED = re.compile(
 API_FAILURE = re.compile(
     r'^\s*(?:•\s*)?Error:\s*(?:Retry\s+failed\s+after\s+\d+\s+attempts?:\s*)?'
     r'OpenAI\s+API\s+error\s*\((402|429)\):\s*\{[^{}]*\}', re.I | re.M)
-KEY_QUOTA = re.compile(r'API\s+Key\s+quota\s+has\s+been\s+exhausted\b|\bapi_key_quota_exhausted\b', re.I)
+QUOTA_EXHAUSTED = re.compile(
+    r'API\s+Key\s+quota\s+has\s+been\s+exhausted\b|'
+    r'\b(?:api_key_quota_exhausted|quota_unavailable|insufficient_quota)\b|'
+    r'No\s+budget\s+pool\s+with\s+available\s+quota\s+could\s+be\s+selected\b|'
+    r'No\s+budget\s+pool\s+bound\s+to\s+this\s+API\s+Key\s+currently\s+has\s+available\s+quota\b', re.I)
 RATE_LIMIT = re.compile(r'"message"\s*:\s*"Rate\s+limit\s+exceeded\b', re.I)
 RATE_CODE = re.compile(r'"code"\s*:\s*"rate_limit_exceeded"', re.I)
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -107,7 +111,7 @@ def terminal_failure(text):
     matches = [(m, 'overload') for m in OVERLOAD_RETRY_FAILED.finditer(text)]
     for m in API_FAILURE.finditer(text):
         error = m.group(0)
-        reason = ('quota exhausted' if m.group(1) == '402' and KEY_QUOTA.search(error)
+        reason = ('quota exhausted' if m.group(1) == '402' and QUOTA_EXHAUSTED.search(error)
                   else 'rate limit' if m.group(1) == '429' and RATE_LIMIT.search(error)
                   and RATE_CODE.search(error) else None)
         # An unrelated later API error must not revive an older candidate.
@@ -393,7 +397,7 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
     cli = choose_cli(cli)
     command = launch_command(cli, arguments)
     print('step-watch: mode=owned-pty UID=%d quiet=%gs cooldown=%gs; '
-          'retry=429,overload deny=402-key-quota-exhausted balance-check=disabled' %
+          'retry=429,overload deny=402-key-or-pool-quota-exhausted balance-check=disabled' %
           (uid, quiet, cooldown), flush=True)
     saved = termios.tcgetattr(0)
     handlers = {}
