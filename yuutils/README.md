@@ -93,6 +93,149 @@ scripts_merge_mpool_csv_to_perfetto.py \
     --trace run.perfetto
 ```
 
+## SIQ 结构化结果与原目录 commit A/B
+
+`--json` 是布尔开关，stdout **恰好一个 JSON 对象**（失败也一样），进度和脱敏错误走
+stderr；不会回显原始 `run.log`。例如沿用原运行参数，再追加开关：
+
+```bash
+run_siq_benchmark.py path/to/scripts/run_project.sh \
+  --adapter adapter --input-dir /absolute/input --serial DEVICE \
+  --siq-project project/adapter --mode repeat_full --loops 10 --json > result.json
+jq '{schema_version,kind,status,measurement_valid,exit_code,validity,performance,memory,sampling}' result.json
+```
+
+结果保留原 summary 字段，增加 `schema_version: 1`、`kind: single|ab`、
+`status: ok|warning|failed|interrupted`、`measurement_valid`、`phase`、`exit_code`、
+`primary_error` / `recovery_error`，以及 `experiment/source/device/performance/memory/sampling/artifacts`。
+`validity` 分开记录原生生命周期、部署、内存、宿主后处理、trace 和源码恢复。
+原生完成、部署和 CSV 有效时，宿主或 merge 失败不会抹掉测量数据；merge/helper warning
+仍返回非零。仅原脚本 native 完成后的 host exit 非零沿用原退出语义（可返回 0，
+但 `status=warning`、`run_exit` 和 `validity.host` 明确记录）。不要仅凭退出码判断测量。
+
+- `performance.<function>` 保留所有选中样本、统计、单位和来源；JSON 统计与比较以这些
+  结构化样本为准，legacy 字段保留。每个请求函数记录 `iteration_counts`、
+  `iteration_composition`（日志中的调用名称序列）与 `calls_per_iteration`；只有已验证窗口内
+  每轮非零且调用构成一致才标 complete，不能用总数整除替代逐轮覆盖。
+  repeat_full 以完整 lifecycle 为一轮，marker 后的 release 仍属于该轮；repeat_process 的
+  逻辑窗口从 lifecycle BEGIN / 上一个 outer marker 到当前 marker，不等于精确函数进入范围。
+  窗口外样本、缺失/无效 lifecycle 标 unverified，缺轮或构成不稳定标 invalid；仍保留样本和 counts。
+  `process_image` 完整且逐窗口对应的细粒度 leave 优先，否则回退完整外层 marker；
+  无 lifecycle 时可以保留选中的 leave/marker 数据，但不声称覆盖完整。
+  首样本不自动删除，stddev 是本次样本的总体标准差，不是独立实验的置信区间。
+  仅完整稳定序列生成 call slot；它是推断的调用序号，不代表已证明的 call-site。
+- 内存单位保持 producer 的 **MB**。sample mean 来自 `*_cur`，peak 来自累计 max 列
+  （缺 max 列时可以使用当前列的采样 max，但来源不同）。joint 指标直接读取同时刻
+  DMA+RSS+GPU mmap total，**绝不把独立 peak 相加**；getrusage 单列保留。
+  缺失指标是 null/missing，不是零。native Summary 与 CSV 校验允许 0.0051 MB 显示舍入。
+- `sampling.configured_period_ms` 与 `actual_interval_ms` 独立；报告样本跨度、重复时间、
+  缺失/未知列和质量警告。非有限值、倒序时间、生命周期不完整、native/CSV 严重不符
+  拒绝测量。PID 与 native peak 校验不等于全时段覆盖证明；没有对齐的生命周期时间戳时
+  `coverage.status=unverified`，不输出虚假的 100% 覆盖率。采样 peak 不是连续时间真 peak。
+- `experiment` 记录输入 digest/帧数、循环模式、配置、脚本/tool hash 和共享 build 的证据。
+  这是启用内存采样时的计时，不是无插桩纯性能。`source` 在创建产物/插桩前快照，记录
+  full HEAD、branch/detached、index/源码 diff 指纹、untracked 摘要、子模块 actual HEAD。
+  `device` 只查询 selected serial 与白名单属性，不保存全部 getprop/env。
+- 产物目录私有（新运行目录 0700、文件 0600）；raw log 仍可能含秘密，仅供本地检查，
+  不应直接上传。日志原文不修改；CSV pull 每次尝试保留独立日志。stdout 的 summary hash
+  指向磁盘 `summary.json`；文件不包含自身 SHA-256。旧 `performance_report` 字符串由
+  结构化统计生成，原 helper 文本保留在私有 `performance.log`。
+  当前部署是扁平目录：install 的 common/libs 与 libs 中出现重复 basename 时，
+  即使字节相同也直接拒绝，不静默折叠；build-before 仅允许真正缺产物的空快照。
+  设备哈希输出中的重复路径/basename、缺项、额外项或异常格式也不能标 deployment verified。
+
+### A/B 切换及恢复
+
+```bash
+run_siq_benchmark.py path/to/scripts/run_project.sh \
+  --adapter adapter --input-dir /absolute/input --siq-project project/adapter \
+  --mode repeat_full --loops 10 --json --ab-test-commit COMMIT > comparison.json
+# --ab_test_commit COMMIT 是同义参数；COMMIT 必须能在本地解析为 commit。
+jq '.comparison | {direction,checks,metrics}' comparison.json
+```
+
+仅在**原 worktree** 运行：目标 detached A → 恢复原 branch/full HEAD/index/源码 → 当前 B。
+不创建 worktree/clone/branch，不使用 force/reset/clean，不篡改 run 脚本，不删除用户 build/cache。
+单次与 A/B 共用原 `siq-benchmark.lock`，入口一次持锁，内层不自锁。
+普通主仓库 tracked staged/unstaged 修改通过事务专属 **tracked-only stash** 保存；
+不 stash untracked/ignored，不 stash 子模块。tracked dirty 子模块、冲突、进行中的 Git 操作、
+staged gitlink 修改及第一层 merge/rebase/custom/none 子模块 update 策略直接拒绝。
+checkout 关闭隐式 submodule recurse，并使用 `--no-overwrite-ignore`；子模块 update 仅为
+`git submodule update --init`（不加 recursive），更新前检查 ignored/untracked 碰撞，更新后核验第一层实际 HEAD。
+快照沿实际 HEAD tree 的 gitlink 边界递归记录已有子模块 HEAD、branch、tracked fingerprint 和初始化状态，
+不扫描 untracked repositories。允许非递归更新不触动的嵌套子模块；已有 initialized nested 身份必须保持不变，
+且目标 A 中 initialized nested actual 必须匹配目标 gitlink，否则明确失败，不继续测量 A，也不补 recursive update。
+未初始化 nested 明确记录为 uninitialized，不主动 init；已知未初始化 nested 的目标 gitlink 改变也保守失败。
+目标新增 nested gitlink 不得借用已有非空/untracked repository。未初始化且非空的第一层子模块目录及
+无法在本地检查的已有子模块目标对象仍会拒绝，不通过强制操作绕过保护。
+
+恢复时原 root/各级子模块 branch OID 不得移动；按 root、父子模块、子子模块顺序恢复原身份，
+已有子模块 actual HEAD 即使不同于原 gitlink 也会恢复，并递归核验 HEAD/branch/index/worktree 指纹。
+原未初始化 nested 保持未初始化；新初始化的第一层依赖保留并记录，不自动 deinit/删除。
+stash 用精确 OID `apply --index`，核验恢复后**仍保留本次 stash**，旧/新用户 stash 都不删除。
+仓库 advisory lock 无法排除外部 Git 并发，不能证明 ref/reflog 的原子删除安全；不直接重写 Git ref/reflog，
+不调用基于 `stash@{0}` 索引的 drop。receipt 的 `stash_dropped=false`、`stash_retained_reason` 以及
+result warnings 明确记录此保留理由；`source_restore=verified` 与 stash 保留互不冲突。
+apply 冲突可能部分应用，停止且不重试。检测到 A 改写 tracked 源码/缓存、恢复冲突或并发
+branch 移动时停止，**不运行 B**。锁不能阻止外部手动 Git 操作/源码编辑；运行期间不要这样操作。
+
+私有 `ab_transaction.json` 记录原身份、阶段、完整 stash OID；持久入口 receipt 位于
+`git rev-parse --absolute-git-dir` 对应的 `siq-benchmark-transaction.json`。stash 前先写
+pending、旧 stash ref 和唯一事务标识，防止在 stash 成功但 OID 尚未落盘时猜测恢复。
+SIGINT/TERM/timeout 会终止子进程组并尝试恢复，primary 与 recovery 错误分开；SIGKILL/断电
+不能执行 finally。下次发现未完成 receipt **直接拒绝**，不要盲删 receipt、不要反复 apply；
+先按 receipt/patch/stash OID 人工确认源码、index、branch、子模块与恢复状态。
+执行层写入的 `active_artifacts` / `patch_receipt` 指向最近一侧的恢复凭据；阶段保存会在
+相同 transaction_id 下合并这两个非空字符串字段，A 测量后、恢复中断时和 B 完成后均保留。
+阶段/stash/原身份仍由事务所有者控制，不全量合并磁盘内容；新事务不继承旧指针，运行中
+receipt 身份变化则拒绝覆盖。正常和恢复失败的最终归档 `ab_transaction.json` 均刷新执行指针；
+若刷新无法核验或写入，保留原 primary/recovery 错误并标记 execution_pointers_verified=false，
+不把上一侧的缓存指针冒充本侧恢复路径。
+
+A 无效则不跑 B；有效 native 加 host/trace warning 可以保留两侧数据。左右输出/log/CSV/trace
+使用不同目录（A/B 不采用单次的 `--output-dir` / `--trace` 覆盖），B 开始前再次验证输入。
+比较方向是 `delta=right-current - left-target`；负耗时/内存表示降低，左为零时 percent=null。
+缺失行 N/A，配置、device/input、计时来源、内存单位/列、采样周期不一致的指标标
+not_comparable。两侧 `calls_per_iteration` 或调用名称/顺序构成不同，也拒绝相关 per-call
+统计收益（delta=null），但不抹掉样本或影响独立可比的内存行；leave 与 outer marker 来源不同不比较。
+部署 hash 各自验证，不要求两侧 hash 相等；源码身份比较 root HEAD + tracked fingerprint +
+各级子模块 actual HEAD/fingerprint，不把 branch/detached 差异当作源码变化。同 HEAD dirty 或
+子模块实际变化且 B 未观察到 build、部署字节相同时，`no_detected_unbuilt_reuse=false` 并拒绝 delta。
+身份/hash/build 元数据不足时该检查为 null，`comparison.build_provenance.unbuilt_reuse=unverified`，
+不声称构建正确。即使 build/hash 有证据，`comparison.build_provenance.build_correctness` 仍是
+`unverified`：共享 build/cache 不是 hermetic clean build，不做因果或显著性结论；输出数值
+正确性始终 `not_verified`。repeat_full 是同进程 N 个生命周期，不是 N 个独立实验。
+
+内存比较还要求实际采样质量一致：`comparison.sampling_quality` 检查实际 interval 的
+median/max，以及 `duration_ms/(sample_count-1)` 的左右最大/最小比值。默认容差为 2，
+可用 `--sampling-quality-tolerance 1.5` 调整（必须有限且 >=1）。点数、跨度、实际统计须
+完整且一致（含统计值必须能由该点数产生，例如两点只有一个 interval，min/median/mean/max 必须相同）；
+跨度缩短且点数同步下降、密度相同，不会仅因总点数变少而拒绝。
+质量缺失/失配、覆盖状态不完整或不同，则内存行标 not_comparable，delta/percent=null，
+保留数值/原因，不影响独立可比的性能行。共同 `comparison.comparable` 不代表每个指标可比，
+应结合各行 status 和 sampling_quality。容差不能绕过缺失或非法元数据；两侧覆盖均为
+unverified 时仍明确警告，质量检查通过也不证明充分采样或连续时间峰值。
+
+### 本地回归与依赖
+
+新增实现只用 Python 标准库，支持 Python 3.8+/POSIX（fcntl/flock、进程组、pthread_sigmask）。
+启动检查 `git`、`bash`、`adb`，并要求可用 adb server/唯一设备；pipeline 原 run 脚本仍负责
+NDK/CMake/编译器与系统命令，缺失时保留私有失败日志，不自动安装。配套性能表格依赖已声明的
+`tabulate`；无新增第三方依赖。
+
+```bash
+python yuutils/utils/run_siq_benchmark.py --self-test
+python -m unittest discover -s yuutils -p 'test_run_siq_benchmark.py'
+python -m unittest discover -s yuutils -p 'test_yuutils_release.py'
+python -m py_compile yuutils/utils/run_siq_benchmark.py
+```
+
+回归仅用合成日志/CSV、临时独立 Git 和本地子模块，包含非递归嵌套初始化状态、目标 gitlink/actual
+不匹配、父先子后恢复、tracked/conflict 与 untracked repository 边界、stash 保留理由、中断与遗留事务；
+不会运行真实设备。
+`test_run_siq_benchmark.py` 进入 sdist。隔离 wheel 验证可将 `BENCHMARK_TEST_SCRIPT` 指向
+临时环境的 `bin/run_siq_benchmark.py`，执行同一测试文件；不要覆盖全局安装。
+
 ## adb-sync 前端
 
 在当前 shell 中启用 yuutils 提供的 `adb` 前端：

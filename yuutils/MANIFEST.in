@@ -1,6 +1,7 @@
 include LICENSE.md
 include README.md
 include test_yuutils_release.py
+include test_run_siq_benchmark.py
 include adb-sync
 include adb-channel
 include adbsync-env.sh

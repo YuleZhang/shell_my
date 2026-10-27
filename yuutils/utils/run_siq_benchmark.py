@@ -11,7 +11,10 @@ in the run directory for auditing and recovery after an uncatchable interruption
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, nullcontext
+import copy
+import getpass
+import uuid
 import datetime as dt
 import difflib
 import fcntl
@@ -321,7 +324,7 @@ class StageProgress:
                 if event['state'] == 'start' and self.active != stage:
                     self.active = stage
                     self.started = event['time']
-                    print(f"[stage] {stage}...", flush=True)
+                    print(f"[stage] {stage}...", file=sys.stderr, flush=True)
                 elif event['state'] == 'end' and self.active == stage:
                     self.finish(event['exit_code'], event['time'])
 
@@ -329,14 +332,13 @@ class StageProgress:
         if self.active is not None:
             elapsed = int((ended if ended is not None else time.monotonic()) - self.started)
             state = 'complete' if exit_code == 0 else f'failed (exit={exit_code})'
-            print(f"[stage] {self.active} {state} ({elapsed}s)", flush=True)
+            print(f"[stage] {self.active} {state} ({elapsed}s)", file=sys.stderr, flush=True)
             self.active = None
 
 
 def print_failed_run_log(log_path: Path) -> None:
-    """Replay the complete run log only after the benchmark has failed."""
-    print('[error] run failed; full run.log follows:', flush=True)
-    subprocess.run(['cat', '--', str(log_path)], check=False)
+    """The transcript may contain credentials: never replay it to the terminal."""
+    print('[error] run failed; private run.log retained for local inspection', file=sys.stderr, flush=True)
 
 
 def build_input_manifest(input_dir: Path) -> dict[str, dict[str, int | str]]:
@@ -434,6 +436,15 @@ def describe_manifest_diff(
     return "; ".join(details)
 
 
+def unique_deployment_basenames(files):
+    seen = set()
+    for path in files:
+        if path.name in seen:
+            raise BenchmarkError('deployment artifact basename collision; flat deployment is ambiguous')
+        seen.add(path.name)
+    return files
+
+
 def deployment_artifacts(repo: Path, abi: str = "arm64-v8a") -> list[Path]:
     """Local artifacts that must match the device, taken from the build that just ran.
 
@@ -458,12 +469,42 @@ def deployment_artifacts(repo: Path, abi: str = "arm64-v8a") -> list[Path]:
         libs = [p for sub in (f"common/libs/{abi}", f"libs/{abi}")
                 for p in sorted((install / sub).glob("*.so"))]
         if libs:
-            return [binary, *libs]
+            return unique_deployment_basenames([binary, *libs])
     local_dir = repo / "scripts/libs" / abi
     files = [local_dir / "siq_test", *sorted(local_dir.glob("*.so"))]
     if not files[0].is_file() or len(files) == 1:
-        raise RuntimeError("cannot verify deployed siq_test and shared libraries")
-    return files
+        raise MissingDeploymentArtifacts("cannot verify deployed siq_test and shared libraries")
+    return unique_deployment_basenames(files)
+
+
+def build_artifact_snapshot(repo):
+    try:
+        files = deployment_artifacts(repo)
+    except MissingDeploymentArtifacts:
+        files = []
+    return {p.name: {'sha256': file_sha256(p), 'size': p.stat().st_size,
+                     'mtime_ns': p.stat().st_mtime_ns} for p in files}
+
+
+def parse_deployment_hashes(output, remote_dir, files):
+    expected = {remote_dir + '/' + p.name for p in files}
+    hashes = {}
+    paths = set()
+    for line in output.splitlines():
+        match = re.fullmatch(r'([0-9a-fA-F]{64})[ \t]+\*?(.+)', line)
+        if not match:
+            raise BenchmarkError('malformed deployment hash output')
+        digest, path = match.groups()
+        name = PurePosixPath(path).name
+        if path in paths or name in hashes:
+            raise BenchmarkError('duplicate deployment hash path or basename')
+        if path not in expected:
+            raise BenchmarkError('unexpected deployment hash path; flat deployment required')
+        paths.add(path)
+        hashes[name] = digest.lower()
+    if paths != expected:
+        raise BenchmarkError('missing deployment hashes')
+    return hashes
 
 
 def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
@@ -481,12 +522,10 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
         [adb, *adb_options, "shell", "sha256sum " + " ".join(shlex.quote(remote_dir + '/' + p.name) for p in files)],
         capture_output=True, text=True, timeout=60, check=True,
     )
-    remote_hashes = {Path(parts[1].lstrip('*')).name: parts[0] for line in result.stdout.splitlines()
-                     if len(parts := line.split(maxsplit=1)) == 2}
+    remote_hashes = parse_deployment_hashes(result.stdout, remote_dir, files)
     hashes = {p.name: file_sha256(p) for p in files}
     if hashes != remote_hashes:
-        raise RuntimeError("deployed binary/library hashes differ from this build: " +
-                           ", ".join(name for name, digest in hashes.items() if remote_hashes.get(name) != digest))
+        raise BenchmarkError('deployed binary/library hashes differ from this build')
     match = SIQ_COMMAND_RE.search(command)
     tokens = shlex.split(match.group('command'))
     frames = int(tokens[tokens.index('-n') + 1])
@@ -530,6 +569,7 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
         if frames <= 0 or count != frames:
             raise RuntimeError(f"deployed input count {count} differs from requested frames {frames}")
         deployment = {'sha256': hashes, 'input_frames': count, 'invocations': 1}
+    deployment['local_build_artifacts'] = build_artifact_snapshot(repo)
     manifest.write_text(json.dumps(deployment, indent=2) + '\n')
 
 
@@ -590,7 +630,7 @@ def run_logged(
     cat_log_on_failure: bool = False,
 ) -> int:
     if stage:
-        print(f"[stage] {stage}...", flush=True)
+        print(f"[stage] {stage}...", file=sys.stderr, flush=True)
         append_debug(debug_log, f"[stage] {stage}...")
     append_debug(debug_log, f"$ {shlex.join(redact_command(command))}")
     timed_out = False
@@ -639,7 +679,7 @@ def run_logged(
     if stage:
         state = "timeout" if timed_out else ("complete" if return_code == 0 else f"finished exit={return_code}")
         stage_result = f"[stage] {stage} {state} ({int(time.monotonic() - started)}s)"
-        print(stage_result, flush=True)
+        print(stage_result, file=sys.stderr, flush=True)
         append_debug(debug_log, stage_result)
     append_debug(
         debug_log,
@@ -712,6 +752,11 @@ def has_process_image_leave(log_text: str) -> bool:
     )
 
 
+def matches_requested_function(actual_name: str, requested_name: str) -> bool:
+    return bool(requested_name == actual_name or requested_name == bare_function_name(actual_name) or re.search(
+        rf"(?<![A-Za-z0-9_]){re.escape(requested_name)}(?![A-Za-z0-9_])", actual_name))
+
+
 def extract_performance_samples(log_text: str, requested: str) -> dict[str, list[float]]:
     requested_names = [name.strip() for name in requested.split(",") if name.strip()]
     samples = {name: [] for name in requested_names}
@@ -729,11 +774,7 @@ def extract_performance_samples(log_text: str, requested: str) -> dict[str, list
         if not bare_name:
             continue
         for requested_name in requested_names:
-            name_boundary = re.search(
-                rf"(?<![A-Za-z0-9_]){re.escape(requested_name)}(?![A-Za-z0-9_])",
-                actual_name,
-            )
-            if requested_name == actual_name or requested_name == bare_name or name_boundary:
+            if matches_requested_function(actual_name, requested_name):
                 samples[requested_name].append(duration)
     return samples
 
@@ -746,6 +787,7 @@ def sample_statistics(values: list[float]) -> dict:
         'median_ms': statistics.median(values),
         'min_ms': min(values),
         'max_ms': max(values),
+        'stddev_ms': statistics.pstdev(values),
         'subsequent_count': len(values) - 1,
         'subsequent_mean_ms': statistics.mean(values[1:]) if len(values) > 1 else None,
         'trimmed_mean_ms': statistics.mean(sorted(values)[1:-1] if len(values) >= 3 else values),
@@ -753,13 +795,10 @@ def sample_statistics(values: list[float]) -> dict:
 
 
 def call_slot_statistics(values: list[float], iterations: int) -> list[dict] | None:
-    """Split a function called more than once per iteration into per-call-site slots.
+    """Legacy positional slots inferred from total count, not proven call-sites.
 
-    A function invoked N times inside one process_image (e.g. compute_weight_map,
-    whose first call is cold and later calls are warm) has samples whose spread is
-    the call site, not run-to-run noise. Averaging them hides both. Only split when
-    the sample count divides evenly by the iteration count, so an early return or a
-    data-dependent branch never silently mis-aligns the slots.
+    Divisibility alone does not prove per-iteration coverage. Structured results
+    call this helper only after verifying stable iteration counts and composition.
     """
     if iterations < 1 or len(values) <= iterations or len(values) % iterations:
         return None
@@ -1000,62 +1039,55 @@ def temporary_source_patch(repo_root: Path, main_source: Path | None, mode: int,
     if main_source is None:
         raise RuntimeError("both loop modes require a discoverable native_test/src/main.cpp")
     sources = [main_source, main_source.with_name('post_process_test.cpp')]
-    git_dir = subprocess.check_output(['git', '-C', str(repo_root), 'rev-parse', '--absolute-git-dir'], text=True).strip()
-    with (Path(git_dir) / 'siq-benchmark.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("another benchmark is already patching this worktree") from exc
-        originals = {}
-        patched = {}
-        descriptions = []
-        patch_parts = []
-        for source, transform in zip(sources, (patch_main_source, patch_process_source)):
-            rel = str(source.relative_to(repo_root))
-            subprocess.run(['git', '-C', str(repo_root), 'ls-files', '--error-unmatch', '--', rel], check=True, capture_output=True)
-            if source.is_symlink():
-                raise RuntimeError(f"refusing symlink source: {source}")
-            originals[rel] = source.read_bytes()
-            text, description = transform(originals[rel].decode('utf-8'), mode, loops)
-            patched[rel] = text.encode('utf-8')
-            descriptions.append(description)
-            patch_parts.append(source_patch(rel, originals[rel], patched[rel]))
-        patch = work_dir / 'loop.patch'
-        patch.write_text(''.join(patch_parts), encoding='utf-8')
-        receipt = {
-            'patch': str(patch), 'mode': mode, 'loops': loops, 'restored': False,
-            'sources': {rel: {'before_sha256': hashlib.sha256(originals[rel]).hexdigest(),
-                              'patched_sha256': hashlib.sha256(patched[rel]).hexdigest()} for rel in originals},
-        }
-        receipt_path = work_dir / 'source_patch.json'
-        receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
-        applied = False
-        # Block termination during the tiny apply/flag window and during rollback.
-        try:
-            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
-            try:
-                git_apply(repo_root, patch)
-                applied = True
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-            print('[stage] apply loop patch complete', flush=True)
-            yield receipt
-        finally:
-            if applied:
-                blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+    originals, patched, descriptions, patch_parts = {}, {}, [], []
+    for source, transform in zip(sources, (patch_main_source, patch_process_source)):
+        rel = str(source.relative_to(repo_root))
+        git_bytes(repo_root, 'ls-files', '--error-unmatch', '--', rel)
+        if source.is_symlink():
+            raise RuntimeError('refusing symlink source')
+        originals[rel] = source.read_bytes()
+        text, description = transform(originals[rel].decode('utf-8'), mode, loops)
+        patched[rel] = text.encode('utf-8')
+        descriptions.append(description)
+        patch_parts.append(source_patch(rel, originals[rel], patched[rel]))
+    patch = work_dir / 'loop.patch'
+    patch.write_text(''.join(patch_parts), encoding='utf-8')
+    receipt = {
+        'patch': str(patch), 'mode': mode, 'loops': loops, 'restored': False,
+        'sources': {rel: {'before_sha256': hashlib.sha256(originals[rel]).hexdigest(),
+                          'patched_sha256': hashlib.sha256(patched[rel]).hexdigest()} for rel in originals},
+    }
+    receipt_path = work_dir / 'source_patch.json'
+    atomic_json(receipt_path, receipt)
+    applied = False
+    try:
+        with protected_recovery():
+            git_apply(repo_root, patch)
+            applied = True
+        print('[stage] apply loop patch complete', file=sys.stderr, flush=True)
+        yield receipt
+    except BaseException as exc:
+        receipt['primary_error'] = safe_error(exc)
+        atomic_json(receipt_path, receipt)
+        raise
+    finally:
+        if applied:
+            with protected_recovery():
                 try:
-                    try:
-                        git_apply(repo_root, patch, reverse=True)
-                    except subprocess.CalledProcessError as exc:
-                        raise RuntimeError(f"source rollback conflicts with concurrent edits; recovery patch: {patch}") from exc
-                    receipt['restored'] = True
+                    git_apply(repo_root, patch, reverse=True)
                     for rel in originals:
                         receipt['sources'][rel]['restored_sha256'] = file_sha256(repo_root / rel)
-                    receipt['exact_restore'] = all((repo_root / rel).read_bytes() == original for rel, original in originals.items())
-                    receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
-                    print('[stage] restore loop patch complete', flush=True)
-                finally:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+                    receipt['exact_restore'] = all((repo_root / rel).read_bytes() == original
+                                                   for rel, original in originals.items())
+                    receipt['restored'] = receipt['exact_restore']
+                    if not receipt['restored']:
+                        raise BenchmarkError('patch reversed but source fingerprints differ; manual recovery required')
+                except BaseException as exc:
+                    receipt['recovery_error'] = safe_error(exc)
+                    atomic_json(receipt_path, receipt)
+                    raise BenchmarkError('loop patch recovery failed; manual recovery required') from exc
+                atomic_json(receipt_path, receipt)
+                print('[stage] restore loop patch complete', file=sys.stderr, flush=True)
 
 
 def collapse_replayed_lifecycle_output(log_text: str, mode: int, loops: int) -> tuple[str, int]:
@@ -1106,6 +1138,14 @@ def validate_run(log_text: str, mode: int, loops: int) -> dict:
     expected = [(str(mode), next(iter(pids)), str(i)) for i in range(1, outer + 1)]
     if begins != expected or [row[:3] for row in ends] != expected or any(row[3] != '0' for row in ends):
         raise RuntimeError(f"incomplete or incorrect lifecycle loops: expected {outer}, begin={len(begins)}, end={len(ends)}")
+    markers = list(LIFECYCLE_MARKER_RE.finditer(log_text))
+    for index in range(outer):
+        begin, end = markers[index * 2:index * 2 + 2]
+        if begin.group('kind') != 'BEGIN' or end.group('kind') != 'END':
+            raise RuntimeError('lifecycle markers are not paired in execution order')
+        count = len(PERF_MARKER_RE.findall(log_text[begin.end():end.start()]))
+        if count != (1 if mode == 1 else loops):
+            raise RuntimeError('timing markers are outside the verified lifecycle scope')
     process_count = len(PERF_MARKER_RE.findall(log_text))
     if process_count != loops:
         raise RuntimeError(f"process_images executed {process_count} times, expected exactly {loops}; artifacts rejected")
@@ -1114,26 +1154,203 @@ def validate_run(log_text: str, mode: int, loops: int) -> dict:
     return {'pid': int(next(iter(pids))), 'lifecycle_count': outer, 'process_count': process_count}
 
 
-def validate_memory_csv(path: Path) -> dict:
+def performance_iteration_windows(clean: str, iterations: int) -> tuple:
+    """Return verified lifecycle and marker-ended logical windows, not call-sites."""
+    lifecycle = list(LIFECYCLE_MARKER_RE.finditer(clean))
+    if not lifecycle:
+        return None, None, None
+    mode = int(lifecycle[0].group('mode'))
+    try:
+        validate_run(clean, mode, iterations)
+    except RuntimeError:
+        return None, None, None
+    full, process = [], []
+    for begin, end in zip(lifecycle[::2], lifecycle[1::2]):
+        full.append((begin.end(), end.start()))
+        boundary = begin.end()
+        for marker in PERF_MARKER_RE.finditer(clean, begin.end(), end.start()):
+            process.append((boundary, marker.start()))
+            boundary = marker.end()
+    return full if mode == 1 else process, process, mode
+
+
+def structured_performance(log_text: str, requested: str, iterations: int) -> dict:
+    """Keep all selected samples; only verified, stable per-iteration series are complete."""
+    clean = ANSI_ESCAPE_RE.sub('', log_text)
+    samples = extract_performance_samples(clean, requested)
+    leaves = [(m.start(), m.group('name').strip(), float(m.group('value')))
+              for m in PERF_LEAVE_RE.finditer(clean)]
+    markers = [(m.start(), 'process_image', float(m.group('value')))
+               for m in PERF_MARKER_RE.finditer(clean)]
+    windows, process_windows, mode = performance_iteration_windows(clean, iterations)
+    result = {}
+    for name in samples:
+        events = [event for event in leaves if matches_requested_function(event[1], name)]
+        source, warnings = 'native_leave_ms', []
+        selected_windows = windows
+        if name == 'process_image':
+            events = [event for event in leaves if bare_function_name(event[1]) == name]
+            selected_windows = process_windows
+            scoped = process_windows is None or all(
+                sum(start <= event[0] < stop for event in events) == 1
+                for start, stop in process_windows)
+            if len(events) != iterations or not scoped:
+                if len(markers) != iterations:
+                    raise RuntimeError('process_image timing coverage is incomplete')
+                if events:
+                    warnings.append('incomplete leave coverage; using complete outer markers')
+                events, source = markers, 'native_outer_marker_ms'
+                # Marker positions are the right-hand boundary of process windows.
+                selected_windows = [(start, stop + 1) for start, stop in process_windows] if process_windows else None
+        values = [event[2] for event in events]
+        if any(not math.isfinite(v) or v < 0 for v in values):
+            raise RuntimeError('invalid timing value')
+        composition = ([[event[1] for event in events if start <= event[0] < stop]
+                        for start, stop in selected_windows] if selected_windows is not None else None)
+        counts = [len(names) for names in composition] if composition is not None else None
+        assigned = counts is not None and sum(counts) == len(values)
+        stable = bool(counts) and all(counts) and all(names == composition[0] for names in composition)
+        complete = assigned and stable
+        status = ('missing' if not values else 'ok' if complete else
+                  'unverified' if not assigned else 'invalid')
+        if status == 'unverified':
+            warnings.append('missing/invalid lifecycle or samples outside logical iteration windows')
+        elif status == 'invalid':
+            warnings.append('missing iteration or inconsistent invocation composition')
+        stats = sample_statistics(values) if values else None
+        calls = counts[0] if complete else None
+        if complete:
+            stats['calls_per_iteration'] = calls
+            slots = call_slot_statistics(values, iterations)
+            if slots:
+                stats['per_call_ms'] = slots
+        result[name] = {
+            'status': status, 'source': source if values else None, 'unit': 'ms',
+            'samples': values, 'coverage': 'complete' if complete else
+                'unverified' if status == 'unverified' else 'incomplete',
+            'iteration_counts': counts, 'iteration_composition': composition,
+            'calls_per_iteration': calls,
+            'iteration_scope': ('lifecycle' if mode == 1 and name != 'process_image' else
+                'lifecycle_begin_or_previous_outer_marker_to_outer_marker') if selected_windows is not None else None,
+            'warnings': warnings, 'statistics': stats,
+            'call_slots': 'inferred invocation order, not proven call-sites',
+        }
+    return result
+
+
+MEMORY_COLUMNS = {
+    'dma': ('dma_cur', 'dma_max_by_sampling', 'DMA Max (sampling)'),
+    'rss': ('rss_cur', 'rss_max_by_sampling', 'RSS Max (sampling)'),
+    'gpu_mmap': ('gpu_mmap_cur', 'gpu_mmap_max_by_sampling', 'GPU mmap Max (sampling)'),
+    'joint': ('cur_of_dma_add_rss_gpumap_by_sampling',
+              'max_of_dma_add_rss_gpumap_by_sampling', 'DMA+RSS+GPU mmap Max (sampling)'),
+}
+
+
+def memory_value(value=None, source=None):
+    return {'value': value, 'unit': 'MB', 'source': source,
+            'status': 'missing' if value is None else 'ok'}
+
+
+def memory_measurement(path: Path, native: str) -> tuple:
+    """Keep producer MB; joint peaks come from simultaneous totals, not sums."""
+    expected = {'time', 'rss_max_by_getrusage'}
+    for current, peak, _ in MEMORY_COLUMNS.values():
+        expected.update((current, peak))
     with path.open(newline='') as stream:
         reader = csv.DictReader(stream)
-        if not reader.fieldnames or 'time' not in reader.fieldnames:
-            raise RuntimeError(f"missing CSV time column: {path}")
-        columns = [c for c in reader.fieldnames if c != 'time']
-        timestamps = []
+        fields = reader.fieldnames or []
+        if 'time' not in fields or len(fields) != len(set(fields)):
+            raise RuntimeError('missing/duplicate memory CSV columns')
+        rows = []
         for row in reader:
             try:
-                stamp = int(row['time'])
-                values = [float(row[c]) for c in columns]
-            except (ValueError, TypeError, KeyError) as exc:
-                raise RuntimeError(f"malformed memory sample: {path}") from exc
-            if not values or not all(math.isfinite(v) for v in values):
-                raise RuntimeError(f"invalid memory sample: {path}")
-            timestamps.append(stamp)
-    if len(timestamps) < 2 or timestamps[-1] <= timestamps[0] or any(b < a for a, b in zip(timestamps, timestamps[1:])):
-        raise RuntimeError(f"incomplete/non-monotonic memory samples: {path}")
-    return {'rows': len(timestamps), 'start_ms': timestamps[0], 'end_ms': timestamps[-1],
-            'duration_ms': timestamps[-1] - timestamps[0], 'sha256': file_sha256(path)}
+                if None in row:
+                    raise ValueError('extra cells')
+                values = {name: float(row[name]) for name in fields}
+                if any(not math.isfinite(v) or v < 0 for v in values.values()):
+                    raise ValueError('non-finite/negative')
+                rows.append(values)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise RuntimeError('invalid memory CSV sample') from exc
+    stamps = [row['time'] for row in rows]
+    intervals = [right - left for left, right in zip(stamps, stamps[1:])]
+    if len(rows) < 2 or stamps[-1] <= stamps[0] or any(v < 0 for v in intervals):
+        raise RuntimeError('incomplete/non-monotonic memory CSV')
+    if not any(name in fields for name in expected - {'time'}):
+        raise RuntimeError('CSV has no recognized memory measurements')
+    for current, peak, _ in MEMORY_COLUMNS.values():
+        if peak in fields and any(r[peak] < l[peak] for l, r in zip(rows, rows[1:])):
+            raise RuntimeError('cumulative sampled peak decreased')
+        if peak in fields and current in fields and any(r[current] > r[peak] + .0051 for r in rows):
+            raise RuntimeError('current usage exceeds producer cumulative peak')
+    clean = ANSI_ESCAPE_RE.sub('', native)
+    def native_number(label, unit):
+        marker = re.search(re.escape(label) + r'\s*:', clean)
+        match = re.search(re.escape(label) + r'\s*:\s*(\d+(?:\.\d+)?)\s*' + unit, clean)
+        if marker and not match:
+            raise RuntimeError('invalid native memory summary value')
+        return float(match.group(1)) if match else None
+    checks, memory = {}, {}
+    for component, (current, peak, label) in MEMORY_COLUMNS.items():
+        peak_column = peak if peak in fields else current if current in fields else None
+        value = max(r[peak_column] for r in rows) if peak_column else None
+        native_value = native_number(label, 'MB')
+        if value is not None and native_value is not None:
+            if abs(value - native_value) > 0.0051:
+                raise RuntimeError('native memory summary disagrees with CSV: ' + component)
+            checks[component] = 'verified_with_display_rounding'
+        else:
+            checks[component] = 'unverified_missing_source'
+        memory[component] = {
+            'sampled_peak': memory_value(value, 'csv:' + peak_column if peak_column else None),
+            'sample_mean': memory_value(statistics.mean(r[current] for r in rows)
+                                       if current in fields else None,
+                                       'csv:' + current if current in fields else None),
+            'native_sampled_peak': memory_value(native_value, 'native_summary:' + label),
+        }
+    column = 'rss_max_by_getrusage'
+    highwater = max(r[column] for r in rows) if column in fields else None
+    native_highwater = native_number('RSS Max (getrusage)', 'MB')
+    if highwater is not None and native_highwater is not None and abs(highwater - native_highwater) > .0051:
+        raise RuntimeError('native RSS getrusage disagrees with CSV')
+    memory['rss']['getrusage_high_water'] = memory_value(highwater, 'csv:' + column if highwater is not None else None)
+    memory['rss']['native_getrusage_high_water'] = memory_value(native_highwater, 'native_summary:RSS Max (getrusage)')
+    memory['cross_validation'] = checks
+    period = native_number('Sampling Period', 'ms')
+    if period is not None and period <= 0:
+        raise RuntimeError('configured sampling period must be positive')
+    duplicates = intervals.count(0)
+    sampling = {
+        'configured_period_ms': period, 'sample_count': len(rows), 'rows': len(rows),
+        'start_ms': stamps[0], 'end_ms': stamps[-1], 'duration_ms': stamps[-1] - stamps[0],
+        'actual_interval_ms': {'min': min(intervals), 'median': statistics.median(intervals),
+                               'mean': statistics.mean(intervals), 'max': max(intervals)},
+        'duplicate_timestamps': duplicates, 'missing_columns': sorted(expected - set(fields)),
+        'unknown_columns': sorted(set(fields) - expected), 'columns': fields,
+        'sha256': file_sha256(path), 'unit': 'MB',
+        'coverage': {'status': 'unverified', 'reason': 'PID and native peaks checked; no aligned lifecycle timestamps'},
+        'warnings': ['sampled peaks are not continuous-time peaks'] +
+                    (['duplicate timestamps'] if duplicates else []) +
+                    (['actual intervals differ from configured period']
+                     if period is not None and statistics.median(intervals) != period else []),
+    }
+    return memory, sampling
+
+
+def safe_native_summary(text):
+    labels = [row[2] for row in MEMORY_COLUMNS.values()] + ['RSS Max (getrusage)', 'Sampling Period']
+    lines = ['Memory Usage Summary']
+    clean = ANSI_ESCAPE_RE.sub('', text)
+    for label in labels:
+        match = re.search(re.escape(label) + r'\s*:\s*(\d+(?:\.\d+)?)\s*(MB|ms)', clean)
+        if match:
+            lines.append(label + ': ' + match.group(1) + ' ' + match.group(2))
+    return '\n'.join(lines)
+
+
+def validate_memory_csv(path: Path) -> dict:
+    return memory_measurement(path, '')[1]
 
 
 def git_revision(repo_root: Path) -> str:
@@ -1167,26 +1384,26 @@ def git_dirty(repo_root: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+def collect_device(adb: str, env: dict[str, str]) -> dict:
+    """Only the selected device and a fixed property whitelist, never all getprop."""
+    def query(arguments):
+        result = subprocess.run([adb, *arguments], env=env, capture_output=True,
+                                text=True, timeout=15)
+        if result.returncode != 0:
+            raise RuntimeError('device identity query failed')
+        return result.stdout.strip()
+    serial = query(['get-serialno'])
+    if not serial or serial == 'unknown':
+        raise RuntimeError('select one adb device using --serial')
+    return {'serial': serial, 'adb_server_socket': env.get('ADB_SERVER_SOCKET'),
+            'soc': query(['shell', 'getprop', 'ro.soc.model']),
+            'model': query(['shell', 'getprop', 'ro.product.model']),
+            'android_version': query(['shell', 'getprop', 'ro.build.version.release'])}
+
+
 def print_adb_context(adb: str, env: dict[str, str]) -> None:
-    print(f"ADB_SERVER_SOCKET={env.get('ADB_SERVER_SOCKET', '')}", flush=True)
-    print(f"ADB_SERIAL={env.get('ADB_SERIAL') or env.get('ANDROID_SERIAL', '')}", flush=True)
-    print("$ adb shell getprop | grep ro.soc.model", flush=True)
-    try:
-        result = subprocess.run(
-            [adb, "shell", "getprop"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("adb shell getprop timed out after 15s") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip()
-        raise RuntimeError(f"adb shell getprop failed: {detail or result.returncode}")
-    soc_lines = [line for line in result.stdout.splitlines() if line.startswith("[ro.soc.model]")]
-    print(soc_lines[0] if soc_lines else "(no ro.soc.model property)", flush=True)
+    collect_device(adb, env)
+    print('[stage] selected adb device identity verified', file=sys.stderr, flush=True)
 
 
 def parse_run_command(args: argparse.Namespace) -> tuple[Path | None, list[str] | None, Path | None]:
@@ -1239,8 +1456,24 @@ def parse_run_command(args: argparse.Namespace) -> tuple[Path | None, list[str] 
     return run_script, tokens, Path(args.output_dir)
 
 
+def sampling_quality_tolerance_value(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise BenchmarkError('sampling quality tolerance must be finite and >= 1') from None
+    if isinstance(value, bool) or not math.isfinite(parsed) or parsed < 1:
+        raise BenchmarkError('sampling quality tolerance must be finite and >= 1')
+    return parsed
+
+
+class ResultArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse may include arbitrary argument values in its error text.
+        raise BenchmarkError('invalid CLI arguments; use --help for supported options')
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = ResultArgumentParser(
         description="Build/deploy/run any native siq_test case and collect memory/performance artifacts."
     )
     parser.add_argument(
@@ -1313,6 +1546,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=1800,
         help="Maximum seconds for each adb/build/run helper command (default: 1800).",
     )
+    parser.add_argument('--sampling-quality-tolerance', type=sampling_quality_tolerance_value, default=2.0,
+                        help='Maximum A/B actual sampling interval ratio for memory comparison (finite >= 1; default: 2).')
+    parser.add_argument('--json', action='store_true', help='Emit exactly one versioned JSON result on stdout.')
+    parser.add_argument('--ab-test-commit', '--ab_test_commit', metavar='COMMIT',
+                        help='Compare target (left) with restored current worktree (right).')
     parser.add_argument("--self-test", action="store_true", help="Run local helper checks and exit.")
     return parser
 
@@ -1459,11 +1697,11 @@ def discover_trace(
     raise RuntimeError(f"cannot uniquely discover Perfetto trace in {output_dir}")
 
 
-def main() -> int:
-    args = build_parser().parse_args()
-    if args.self_test:
-        self_test()
-        return 0
+def run_single(args, result) -> int:
+    benchmark_started = time.monotonic()
+    result['experiment']['started_at'] = utc_now()
+    result['source'] = source_snapshot(args.repo_root)
+    result['phase'] = 'preflight'
 
     real_adb = shutil.which("adb")
     if not real_adb:
@@ -1473,7 +1711,9 @@ def main() -> int:
         env["ANDROID_SERIAL"] = args.serial
     elif env.get("ADB_SERIAL") and not env.get("ANDROID_SERIAL"):
         env["ANDROID_SERIAL"] = env["ADB_SERIAL"]
-    print_adb_context(real_adb, env)
+    result['device'] = collect_device(real_adb, env)
+    env['ANDROID_SERIAL'] = result['device']['serial']
+    print('[stage] selected adb device identity verified', file=sys.stderr, flush=True)
 
     run_script, supplied_run_args, _ = parse_run_command(args)
     args.run_script = run_script
@@ -1487,7 +1727,7 @@ def main() -> int:
         repo_root = run_script.parent.parent
     else:
         repo_root = Path.cwd().resolve()
-    args.user = args.user or "zhangyu"
+    args.user = args.user or getpass.getuser()
     args.host = args.host or "localhost"
     args.use_usb = args.use_usb if args.use_usb is not None else 1
     args.debug_mode = args.debug_mode if args.debug_mode is not None else 0
@@ -1535,7 +1775,24 @@ def main() -> int:
     revision = git_revision(repo_root)
     base_work_dir = (args.work_dir or repo_root / "temp/native_benchmark").expanduser().resolve()
     work_dir = base_work_dir / f"{timestamp}_{revision}_{args.adapter}"
-    work_dir.mkdir(parents=True, exist_ok=False)
+    work_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    result['artifacts']['summary'] = {'path': str(work_dir / 'summary.json')}
+    result['_work_dir'] = str(work_dir)
+    if getattr(args, '_active_path', None):
+        active_record = json.loads(args._active_path.read_text())
+        active_record['active_artifacts'] = str(work_dir)
+        active_record['patch_receipt'] = str(work_dir / 'source_patch.json')
+        atomic_json(args._active_path, active_record)
+    manifest_before = build_input_manifest(input_dir)
+    result['experiment'].update({
+        'run_id': work_dir.name, 'project': siq_project, 'adapter': args.adapter,
+        'platform': args.platform, 'debug_mode': args.debug_mode,
+        'mode': args.mode, 'requested_repeat': args.loops,
+        'input_digest': object_digest(manifest_before), 'instrumentation': 'memory_sampling',
+        'run_script_sha256': file_sha256(run_script), 'tool_sha256': file_sha256(Path(__file__)),
+        'build_provenance': 'unverified', 'build_policy': 'shared existing build/cache; full run script invoked',
+        'output_correctness': 'not_verified',
+    })
     debug_log = work_dir / "debug.log"
     append_debug(debug_log, f"work_dir: {work_dir}")
     output_dir = (args.output_dir or work_dir / "output").expanduser().resolve()
@@ -1656,6 +1913,11 @@ def main() -> int:
     else:
         env["PATH"] = f"{wrapper_dir}{os.pathsep}{env.get('PATH', '')}"
         run_command = ["bash", str(run_script), *run_args]
+    result['experiment']['build_before'] = build_artifact_snapshot(repo_root)
+    result['experiment']['companion_tools_sha256'] = {
+        'performance': file_sha256(process_sdk_log), 'merge': file_sha256(merge_script)}
+    result['phase'] = 'build_deploy_run'
+    result['artifacts']['run_log'] = artifact_info(run_log)
     with temporary_source_patch(repo_root, main_source, args.mode, args.loops, work_dir) as patch_receipt:
         if use_adbsync:
             cleanup_exit = run_logged(
@@ -1688,8 +1950,17 @@ def main() -> int:
             stage_events=stage_events,
             cat_log_on_failure=True,
         )
+    result['run_exit'] = run_exit
+    events = [json.loads(line) for line in stage_events.read_text().splitlines()] if stage_events.exists() else []
+    result['experiment']['full_build_invocation_observed'] = any(
+        event.get('stage') == 'build SDK' and event.get('state') == 'end' and event.get('exit_code') == 0
+        for event in events)
+    result['experiment']['build_after'] = build_artifact_snapshot(repo_root)
+    result['source']['run_log_sha256'] = file_sha256(run_log)
+    result['phase'] = 'validate_native'
     log_text = run_log.read_text(encoding="utf-8", errors="ignore")
     log_text, replayed_copies = collapse_replayed_lifecycle_output(log_text, args.mode, args.loops)
+    result['source']['replayed_lifecycle_copies_removed'] = replayed_copies
     if replayed_copies:
         append_debug(debug_log, f"collapsed {replayed_copies} byte-identical lifecycle log copies")
     build_log_line = extract_build_log_line(log_text)
@@ -1697,7 +1968,9 @@ def main() -> int:
         append_debug(debug_log, f"[build] {build_log_line}")
     else:
         append_debug(debug_log, "[build] no representative build command found in run.log")
-    performance_samples = extract_performance_samples(log_text, args.functions)
+    performance = structured_performance(log_text, args.functions, args.loops)
+    performance_samples = {name: metric['samples'] for name, metric in performance.items()}
+    result['performance'] = performance
     if run_exit in (124, -signal.SIGTERM, -signal.SIGKILL):
         raise RuntimeError(f"benchmark interrupted/timed out (exit {run_exit}); artifacts rejected")
     try:
@@ -1707,6 +1980,17 @@ def main() -> int:
             print_failed_run_log(run_log)
         raise RuntimeError(f"{exc}; run script exit={run_exit}; see {run_log}") from exc
     deployment = json.loads((work_dir / "deployment.json").read_text())
+    if (deployment.get('input_manifest') != manifest_before or
+            deployment.get('remote_input_manifest') != manifest_before or
+            build_input_manifest(input_dir) != manifest_before):
+        raise RuntimeError('input changed or deployment lacks independent input verification')
+    result['experiment'].update({'input_frames': deployment['input_frames'],
+                                 'actual_repeat': validation['process_count'],
+                                 'processes': 1, 'lifecycle_calls': validation['lifecycle_count']})
+    result['deployment'] = deployment
+    result['validity']['native'] = 'valid'
+    result['validity']['deployment'] = 'verified'
+    result['phase'] = 'collect_memory'
     run_warning = None
     if run_exit != 0:
         run_warning = f"run script exited {run_exit} after verified native completion (host post-processing failed)"
@@ -1748,7 +2032,7 @@ def main() -> int:
                 [real_adb, "pull", str(moved_remote), str(csv_local)],
                 repo_root,
                 env,
-                pull_log,
+                work_dir / f"adb_pull_{index:02d}_relocated.log",
                 args.timeout,
                 debug_log,
                 "pull memory CSV (relocated by the run script)",
@@ -1757,8 +2041,13 @@ def main() -> int:
                 raise RuntimeError(
                     f"adb pull failed for {csv_remote} and for {moved_remote}; see {pull_log}"
                 )
-        csv_validation[csv_local.name] = validate_memory_csv(csv_local)
+        memory, sampling = memory_measurement(csv_local, memory_summary)
+        result['memory'], result['sampling'] = memory, sampling
+        csv_validation[csv_local.name] = sampling
         csv_locals.append(csv_local)
+    result['validity']['memory'] = 'valid'
+    result['measurement_valid'] = True
+    result['phase'] = 'host_postprocess'
 
     performance_log = work_dir / "performance.log"
     performance_input_log = prepare_process_sdk_log(
@@ -1784,21 +2073,20 @@ def main() -> int:
         debug_log,
         "process performance log",
     )
-    if process_exit != 0:
-        raise RuntimeError(f"process_sdk_log.py failed; see {performance_log}")
     performance_report = performance_log.read_text(encoding="utf-8", errors="ignore").strip()
-    if not performance_report or "No data" in performance_report:
-        raise RuntimeError(f"performance report has no usable samples; see {performance_log}")
+    performance_warning = None
+    if process_exit != 0:
+        performance_warning = 'performance helper failed; structured native samples retained'
     append_performance_samples(debug_log, performance_samples)
     append_debug(debug_log, "=== performance ===\n" + performance_report)
 
-    # Results are useful even when trace post-processing fails. Print them before
-    # the optional merge stage so a bad trace never hides the benchmark evidence.
-    timing_statistics = performance_statistics(performance_samples, validation['process_count'])
-    print_measurement_scope(validation, timing_statistics)
-    print(memory_summary, flush=True)
-    print("=== process_sdk_log performance ===", flush=True)
-    print(performance_report, flush=True)
+    timing_statistics = {name: metric['statistics'] for name, metric in performance.items()
+                         if metric['statistics'] is not None}
+    if not args.json:
+        print_measurement_scope(validation, timing_statistics)
+        for component, metrics in result['memory'].items():
+            if component != 'cross_validation':
+                print(component + ' sampled peak (MB): ' + str(metrics['sampled_peak']['value']), flush=True)
 
     trace_path: Path | None = None
     merged_trace: Path | None = None
@@ -1809,6 +2097,7 @@ def main() -> int:
             raise RuntimeError(f"Perfetto trace is empty: {trace_path}")
         captured_trace = work_dir / trace_path.name
         shutil.copy2(trace_path, captured_trace)
+        captured_trace.chmod(0o600)
         trace_path = captured_trace
         merged_trace = work_dir / f"{trace_path.stem}.memory-overlay.perfetto"
         print("memory CSV: " + ", ".join(str(path) for path in csv_locals), flush=True)
@@ -1859,12 +2148,12 @@ def main() -> int:
                 break
             current_trace = next_trace
     except (OSError, RuntimeError) as exc:
-        merge_warning = f"Perfetto merge skipped: {exc}"
+        merge_warning = 'Perfetto merge skipped; private diagnostics retained'
         append_debug(debug_log, f"[warning] {merge_warning}")
 
     summary = {
         "commit": revision,
-        "working_tree_dirty": git_dirty(repo_root),
+        "working_tree_dirty": result['source']['tracked_dirty'],
         "run_script_sha256": file_sha256(run_script),
         "main_source_sha256": file_sha256(main_source),
         "adapter": args.adapter,
@@ -1888,7 +2177,7 @@ def main() -> int:
         "adbsync": use_adbsync,
         "run_exit": run_exit,
         "run_warning": run_warning,
-        "memory_summary": memory_summary,
+        "memory_summary": safe_native_summary(memory_summary),
         "csv_remote": csv_remotes,
         "csv_local": [str(path) for path in csv_locals],
         "trace": str(trace_path) if trace_path else None,
@@ -1896,7 +2185,7 @@ def main() -> int:
         "merge_warning": merge_warning,
         "run_log": str(run_log),
         "performance_log": str(performance_log),
-        "performance_report": performance_report,
+        "performance_report": json.dumps(timing_statistics, sort_keys=True),
         "performance_samples_ms": performance_samples,
         "performance_statistics_ms": timing_statistics,
         "measurement_scope": {"processes": 1, "lifecycle_calls": validation["lifecycle_count"],
@@ -1904,26 +2193,916 @@ def main() -> int:
                               "memory_peak": "entire process, all lifecycle calls"},
         "debug_log": str(debug_log),
     }
-    summary_path = work_dir / "summary.json"
-    summary_json = json.dumps(summary, ensure_ascii=False, indent=2)
-    summary_path.write_text(summary_json + "\n", encoding="utf-8")
-    append_debug(debug_log, "=== summary.json ===\n" + summary_json)
+    result.update(summary)
+    warnings = [w for w in (run_warning, merge_warning, performance_warning) if w]
+    warnings.append('shared build provenance unverified; no causal or output correctness claim')
+    result['warnings'] = warnings
+    result['status'] = 'warning' if run_warning or merge_warning or performance_warning else 'ok'
+    result['validity'].update({'host': 'warning' if run_warning or performance_warning else 'ok',
+                               'trace': 'warning' if merge_warning else 'ok',
+                               'source_restore': 'verified' if patch_receipt.get('exact_restore') else 'failed'})
+    result['source']['patch'] = patch_receipt
+    result['artifacts'].update({
+        'run_log': artifact_info(run_log), 'csv': [artifact_info(p) for p in csv_locals],
+        'trace': artifact_info(trace_path), 'merged_trace': artifact_info(merged_trace),
+        'deployment': artifact_info(work_dir / 'deployment.json'),
+        'patch_receipt': artifact_info(work_dir / 'source_patch.json'),
+        'patch': artifact_info(work_dir / 'loop.patch'),
+        'pull_attempts': [artifact_info(p) for p in sorted(work_dir.glob('adb_pull_*.log'))],
+    })
+    result['experiment'].update({'ended_at': utc_now(),
+                                  'elapsed_seconds': time.monotonic() - benchmark_started})
+    result['phase'] = 'complete'
+    save_result(result)
     if merged_trace and merged_trace.is_file():
         print(f"merged perfetto: {merged_trace}", flush=True)
     else:
         print(f"merged perfetto: unavailable ({merge_warning or 'no trace output'})", flush=True)
     if not merge_warning and run_exit == 0:
         print(f"run log: {run_log}", flush=True)
-    print(f"summary: {summary_path}", flush=True)
-    return 1 if merge_warning else 0
+    print(f"summary: {result['artifacts']['summary']['path']}", flush=True)
+    print(f"total elapsed: {time.monotonic() - benchmark_started:.1f}s", flush=True)
+    return 1 if merge_warning or performance_warning else 0
+
+
+class BenchmarkError(RuntimeError):
+    """Messages constructed by this module, safe for public diagnostics."""
+
+
+class MissingDeploymentArtifacts(BenchmarkError):
+    """Build-before may legitimately have no executable/library payload yet."""
+
+
+def safe_error(exc):
+    if isinstance(exc, BenchmarkError):
+        return {'type': type(exc).__name__, 'message': str(exc)}
+    if isinstance(exc, KeyboardInterrupt):
+        return {'type': 'Interrupted', 'message': 'interrupted; inspect recovery receipt'}
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return {'type': 'Timeout', 'message': 'command timed out; private artifacts retained'}
+    return {'type': type(exc).__name__, 'message': 'operation failed; private artifacts retained (no raw exception output)'}
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def object_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def atomic_json(path, value):
+    """Durable private receipt, including the pre-stash pending window."""
+    path = Path(path)
+    temporary = path.with_name(path.name + '.pending-write')
+    with temporary.open('w', encoding='utf-8') as stream:
+        os.chmod(temporary, 0o600)
+        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def artifact_info(path):
+    return {'path': str(path) if path else None, 'sha256': file_sha256(path)}
+
+
+@contextmanager
+def protected_recovery():
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def git_bytes(repo, *arguments, optional=False):
+    command = ['git', '-c', 'submodule.recurse=false', '-c', 'core.hooksPath=/dev/null',
+               '-C', str(repo), *arguments]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        stdout, _ = process.communicate(timeout=120)
+    except BaseException:
+        terminate_process_group(process)
+        raise
+    if process.returncode != 0 and not optional:
+        raise BenchmarkError('Git operation failed: ' + arguments[0] +
+                             '; no force/reset/clean recovery attempted')
+    return stdout if process.returncode == 0 else b''
+
+
+def git_text(repo, *arguments, **kwargs):
+    return git_bytes(repo, *arguments, **kwargs).decode('utf-8', errors='surrogateescape').strip()
+
+
+def git_head(repo):
+    return git_text(repo, 'rev-parse', '--verify', 'HEAD')
+
+
+def git_branch(repo):
+    return git_text(repo, 'symbolic-ref', '-q', 'HEAD', optional=True) or None
+
+
+def tracked_fingerprint(repo):
+    return {name: hashlib.sha256(git_bytes(repo, *arguments)).hexdigest()
+            for name, arguments in (
+                ('index', ('ls-files', '--stage', '-z')),
+                ('staged', ('diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')),
+                ('unstaged', ('diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')))}
+
+
+def tracked_dirty(repo):
+    # Ignore unstaged gitlink/actual differences, but never hide index gitlink edits.
+    return bool(git_bytes(repo, 'status', '--porcelain', '--untracked-files=no', '--ignore-submodules=all') or
+                git_bytes(repo, 'diff', '--cached', '--raw', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none'))
+
+
+def tree_entries(repo, oid):
+    entries = {}
+    for item in git_bytes(repo, 'ls-tree', '-rz', oid).split(b'\0'):
+        if item:
+            meta, path = item.split(b'\t', 1)
+            mode, kind, sha = meta.decode().split()
+            entries[os.fsdecode(path)] = (mode, kind, sha)
+    return entries
+
+
+def submodule_state(directory, oid, parent=None):
+    if directory.is_symlink():
+        raise BenchmarkError('symlink submodule directory refused')
+    has_git = (directory / '.git').exists()
+    head = git_text(directory, 'rev-parse', '--verify', 'HEAD', optional=True) if has_git else None
+    return {'gitlink': oid, 'head': head or None, 'parent': parent,
+            'branch': git_branch(directory) if head else None,
+            'initialization': 'head' if head else 'gitdir_no_head' if has_git else 'uninitialized',
+            'tracked_dirty': tracked_dirty(directory) if head else False,
+            'actual_matches_gitlink': head == oid,
+            'fingerprint': tracked_fingerprint(directory) if head else None}
+
+
+def submodule_snapshot(repo, include_nested=True):
+    """Follow actual HEAD gitlinks only, never discover untracked repositories."""
+    result = {}
+    def visit(directory, prefix='', parent=None):
+        for path, (mode, _, oid) in tree_entries(directory, 'HEAD').items():
+            if mode != '160000':
+                continue
+            full_path = prefix + path
+            state = submodule_state(directory / path, oid, parent)
+            result[full_path] = state
+            if include_nested and state['head']:
+                visit(directory / path, full_path + '/', full_path)
+    visit(repo)
+    return result
+
+
+def source_snapshot(repo):
+    fingerprint = tracked_fingerprint(repo)
+    untracked = git_bytes(repo, 'ls-files', '--others', '--exclude-standard', '-z')
+    return {'head': git_head(repo), 'branch': git_branch(repo),
+            'tracked_dirty': tracked_dirty(repo), 'fingerprint': fingerprint,
+            'diff_digest': object_digest(fingerprint),
+            'untracked': {'count': len([p for p in untracked.split(b'\0') if p]),
+                          'paths_digest': hashlib.sha256(untracked).hexdigest()},
+            'submodules': submodule_snapshot(repo)}
+
+
+@contextmanager
+def benchmark_lock(repo):
+    directory = Path(git_text(repo, 'rev-parse', '--absolute-git-dir'))
+    with (directory / 'siq-benchmark.lock').open('a') as stream:
+        os.chmod(directory / 'siq-benchmark.lock', 0o600)
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BenchmarkError('another benchmark holds siq-benchmark.lock') from exc
+        yield directory
+
+
+def new_result(kind='single'):
+    return {'schema_version': 1, 'kind': kind, 'status': 'failed', 'measurement_valid': False,
+            'phase': 'preflight', 'exit_code': 1, 'primary_error': None, 'recovery_error': None,
+            'warnings': [], 'validity': {'native': 'not_run', 'memory': 'not_run',
+                                       'host': 'not_run', 'trace': 'not_run', 'source_restore': 'not_run'},
+            'experiment': {}, 'source': {}, 'device': {}, 'performance': {},
+            'memory': {}, 'sampling': {}, 'artifacts': {}}
+
+
+def public_result(result):
+    return {key: value for key, value in result.items() if not key.startswith('_')}
+
+
+def save_result(result):
+    if result.get('_work_dir'):
+        path = Path(result['_work_dir']) / 'summary.json'
+        saved = copy.deepcopy(public_result(result))
+        saved['artifacts'].setdefault('summary', {'path': str(path)}).pop('sha256', None)
+        atomic_json(path, saved)
+        # A file cannot contain its own SHA-256; the stdout envelope references it.
+        result['artifacts']['summary'] = artifact_info(path)
+
+
+def execute_single(args):
+    result = new_result()
+    started = time.monotonic()
+    try:
+        result['exit_code'] = run_single(args, result)
+    except BaseException as exc:
+        result['primary_error'] = safe_error(exc)
+        result['exit_code'] = (130 if isinstance(exc, KeyboardInterrupt) else
+                               124 if isinstance(exc, subprocess.TimeoutExpired) or result.get('run_exit') == 124 else 1)
+        result['status'] = 'interrupted' if isinstance(exc, KeyboardInterrupt) else 'failed'
+    finally:
+        result['experiment'].update({'ended_at': utc_now(), 'elapsed_seconds': time.monotonic() - started})
+        work = Path(result['_work_dir']) if result.get('_work_dir') else None
+        if work:
+            result['artifacts']['run_log'] = artifact_info(work / 'run.log')
+            patch_file = work / 'source_patch.json'
+            if patch_file.exists():
+                patch = json.loads(patch_file.read_text())
+                result['source']['patch'] = patch
+                if not patch.get('restored'):
+                    result['recovery_error'] = patch.get('recovery_error') or safe_error(BenchmarkError('patch restore unverified'))
+                    result['measurement_valid'] = False
+                if patch.get('primary_error'):
+                    result['primary_error'] = patch['primary_error']
+        if result['source'].get('head') and not result['recovery_error']:
+            try:
+                verify_original(args.repo_root, result['source'])
+                result['validity']['source_restore'] = 'verified'
+            except BaseException as exc:
+                result['recovery_error'] = safe_error(exc)
+                result['measurement_valid'] = False
+                result['status'], result['exit_code'] = 'failed', 1
+        if result['recovery_error']:
+            result['validity']['source_restore'] = 'failed'
+        save_result(result)
+    return result
+
+
+def reject_in_progress(repo):
+    if git_bytes(repo, 'ls-files', '--unmerged', '-z'):
+        raise BenchmarkError('unresolved Git conflicts; benchmark refused')
+    for name in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-apply', 'rebase-merge', 'sequencer'):
+        path = Path(git_text(repo, 'rev-parse', '--git-path', name))
+        if not path.is_absolute():
+            path = repo / path
+        if path.exists():
+            raise BenchmarkError('in-progress Git operation; benchmark refused')
+
+
+def protected_collisions(repo, oid):
+    """Git protects untracked files; additionally protect ignored files and ancestors."""
+    destinations = [p for p, (mode, _, _) in tree_entries(repo, oid).items() if mode != '160000']
+    others = git_bytes(repo, 'ls-files', '--others', '--exclude-standard', '-z')
+    ignored = git_bytes(repo, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
+    paths = [os.fsdecode(p) for p in (others + ignored).split(b'\0') if p]
+    for existing in paths:
+        if any(existing == dest or existing.startswith(dest + '/') or dest.startswith(existing + '/')
+               for dest in destinations):
+            raise BenchmarkError('untracked/ignored checkout collision; benchmark refused (files retained)')
+
+
+def module_paths(repo, oid):
+    if '.gitmodules' not in tree_entries(repo, oid):
+        return {}
+    output = git_text(repo, 'config', '--blob', oid + ':.gitmodules', '--get-regexp',
+                      r'^submodule\..*\.path$', optional=True)
+    result = {}
+    for line in output.splitlines():
+        key, path = line.split(None, 1)
+        if Path(path).is_absolute() or '..' in PurePosixPath(path).parts:
+            raise BenchmarkError('unsafe submodule path; benchmark refused')
+        result[path] = key[len('submodule.'):-len('.path')]
+    return result
+
+
+def check_module_strategy(repo, oid):
+    for _, name in module_paths(repo, oid).items():
+        key = 'submodule.' + name + '.update'
+        local = git_text(repo, 'config', '--get', key, optional=True)
+        declared = git_text(repo, 'config', '--blob', oid + ':.gitmodules', '--get', key, optional=True)
+        if any(value and value != 'checkout' for value in (local, declared)):
+            raise BenchmarkError('only checkout submodule update strategy is allowed; merge/rebase/custom/none refused')
+
+
+def check_modules_clean(repo):
+    for path, state in submodule_snapshot(repo).items():
+        if state['head']:
+            directory = repo / path
+            reject_in_progress(directory)
+            if state['tracked_dirty']:
+                raise BenchmarkError('tracked dirty submodule; benchmark refused (no submodule stash)')
+
+
+def checkout(repo, oid=None, branch=None):
+    if branch:
+        if git_text(repo, 'rev-parse', '--verify', branch) != oid:
+            raise BenchmarkError('original branch moved concurrently; manual recovery required')
+        target = branch[len('refs/heads/'):]
+        git_bytes(repo, 'checkout', '--no-overwrite-ignore', '--no-recurse-submodules', target, '--')
+    else:
+        git_bytes(repo, 'checkout', '--detach', '--no-overwrite-ignore', '--no-recurse-submodules', oid, '--')
+    if git_head(repo) != oid or git_branch(repo) != branch:
+        raise BenchmarkError('checkout identity verification failed')
+
+
+def check_nested_target_paths(directory, target, prefix, known):
+    for path, (mode, _, oid) in tree_entries(directory, target).items():
+        if mode != '160000':
+            continue
+        full_path = prefix + '/' + path
+        child = directory / path
+        if child.is_symlink():
+            raise BenchmarkError('symlink nested submodule directory refused')
+        state = known.get(full_path)
+        if state is None and child.exists() and (not child.is_dir() or any(child.iterdir())):
+            raise BenchmarkError('new target nested gitlink collides with nonempty path; untracked repository retained')
+        # No nested checkout is performed. A differing actual HEAD will be refused
+        # after the first-level update; only matching local trees need traversal.
+        if state and state['head'] == oid:
+            check_nested_target_paths(child, oid, full_path, known)
+
+
+def update_modules(repo, *, restoring=None):
+    oid = git_head(repo)
+    check_module_strategy(repo, oid)
+    before = submodule_snapshot(repo)
+    known = dict(restoring or {})
+    known.update(before)
+    # Restore may revisit a gitlink removed by A. Inspect only paths recorded in
+    # the original tree, not arbitrary repositories left in the worktree.
+    nested_before = {path: submodule_state(repo / path, state['gitlink'], state['parent'])
+                     for path, state in known.items() if state['parent'] is not None}
+    for path, state in nested_before.items():
+        if state['head']:
+            reject_in_progress(repo / path)
+            if state['tracked_dirty']:
+                raise BenchmarkError('tracked dirty nested submodule; update refused')
+    for path, (mode, _, target) in tree_entries(repo, oid).items():
+        if mode != '160000':
+            continue
+        directory = repo / path
+        if directory.is_symlink():
+            raise BenchmarkError('symlink submodule directory refused')
+        if (directory / '.git').exists() and git_text(directory, 'rev-parse', '--verify', 'HEAD', optional=True):
+            reject_in_progress(directory)
+            if tracked_dirty(directory):
+                raise BenchmarkError('tracked submodule changed; update refused')
+            # Require locally inspectable target before updating an existing checkout.
+            protected_collisions(directory, target)
+            check_nested_target_paths(directory, target, path, known)
+        elif directory.exists() and any(p.name != '.git' for p in directory.iterdir()):
+            raise BenchmarkError('nonempty uninitialized submodule directory; collision safety cannot be proved')
+    # Intentionally no --force, --recursive, --remote or strategy override.
+    git_bytes(repo, 'submodule', 'update', '--init')
+    for path, state in nested_before.items():
+        now = submodule_state(repo / path, state['gitlink'], state['parent'])
+        if any(now[key] != state[key] for key in ('head', 'branch', 'fingerprint', 'initialization')):
+            raise BenchmarkError('nonrecursive update changed existing nested submodule identity; recovery required')
+    for path, state in submodule_snapshot(repo).items():
+        if state['parent'] is None:
+            if not state['actual_matches_gitlink']:
+                raise BenchmarkError('submodule update succeeded but gitlink/actual HEAD differ')
+        elif restoring is None:
+            if state['head'] and not state['actual_matches_gitlink']:
+                raise BenchmarkError('nested actual HEAD differs from target gitlink; nonrecursive update cannot satisfy A')
+            previous = before.get(path)
+            if not state['head'] and previous and state['gitlink'] != previous['gitlink']:
+                raise BenchmarkError('uninitialized nested target gitlink changed; nonrecursive update cannot satisfy A')
+    check_modules_clean(repo)
+
+
+def verify_original(repo, original):
+    current = source_snapshot(repo)
+    for key in ('head', 'branch', 'fingerprint'):
+        if current[key] != original[key]:
+            raise BenchmarkError('original root HEAD/branch/index/worktree restoration did not verify')
+    for path, state in original['submodules'].items():
+        now = current['submodules'].get(path, {})
+        if state['head']:
+            if any(now.get(key) != state[key] for key in ('head', 'branch', 'fingerprint')):
+                raise BenchmarkError('existing submodule actual HEAD/branch/index restoration did not verify')
+        elif state.get('parent') is not None and now.get('initialization') != state['initialization']:
+            raise BenchmarkError('original uninitialized nested submodule state did not verify')
+    return current
+
+
+class ABTransaction:
+    def __init__(self, repo, receipt, original, target):
+        self.repo, self.path = repo, receipt
+        self.data = {'schema_version': 1, 'kind': 'ab', 'state': 'prepared',
+                     'transaction_id': uuid.uuid4().hex, 'started_at': utc_now(),
+                     'original': original, 'target': target, 'stash_oid': None,
+                     'stash_previous': git_text(repo, 'rev-parse', '--verify', 'refs/stash', optional=True) or None,
+                     'primary_error': None, 'recovery_error': None, 'commands_policy': 'no force/reset/clean'}
+        self.save(initial=True)
+
+    def save(self, initial=False):
+        if not initial:
+            disk = json.loads(self.path.read_text())
+            if (disk.get('kind') != self.data['kind'] or
+                    disk.get('transaction_id') != self.data['transaction_id']):
+                raise BenchmarkError('transaction receipt identity changed; refusing to overwrite')
+            pointers = {}
+            for field in ('active_artifacts', 'patch_receipt'):
+                if field in disk:
+                    value = disk[field]
+                    if not isinstance(value, str) or not value:
+                        raise BenchmarkError('invalid execution recovery pointer; receipt retained')
+                    pointers[field] = value
+            self.data.update(pointers)
+        atomic_json(self.path, self.data)
+
+    def stage(self, state):
+        previous = self.data['state']
+        self.data['state'] = state
+        try:
+            self.save()
+        except BaseException:
+            self.data['state'] = previous
+            raise
+
+    def switch(self):
+        if self.data['original']['tracked_dirty']:
+            self.data['stash_message'] = 'siq-benchmark-' + self.data['transaction_id']
+            self.stage('stash_pending')
+            with protected_recovery():
+                git_bytes(self.repo, 'stash', 'push', '-m', self.data['stash_message'])
+                oid = git_text(self.repo, 'rev-parse', '--verify', 'refs/stash')
+                if oid == self.data['stash_previous'] or self.data['stash_message'] not in git_text(self.repo, 'log', '-1', '--format=%s', oid):
+                    raise BenchmarkError('stash identity could not be verified; pending receipt retained')
+                self.data['stash_oid'] = oid
+                self.stage('stash_saved')
+        if tracked_dirty(self.repo):
+            raise BenchmarkError('root tracked modifications remain after tracked-only stash')
+        self.stage('switching_left')
+        checkout(self.repo, self.data['target'])
+        update_modules(self.repo)
+        self.data['left_source'] = source_snapshot(self.repo)
+        self.data['left_preserved_nested'] = {
+            path: submodule_state(self.repo / path, state['gitlink'], state['parent'])
+            for path, state in self.data['original']['submodules'].items()
+            if state['parent'] is not None and state['head']}
+        self.stage('left_ready')
+
+    def restore(self):
+        with protected_recovery():
+            if self.data['state'] == 'stash_pending':
+                raise BenchmarkError('stash pending window unresolved; do not guess stash identity or auto-apply')
+            if self.data.get('stash_apply_state') in ('pending', 'failed'):
+                raise BenchmarkError('stash apply may have partially applied; no automatic retry')
+            if tracked_dirty(self.repo):
+                raise BenchmarkError('unexpected tracked root edits; recovery stopped to retain evidence')
+            check_modules_clean(self.repo)
+            if self.data.get('left_source') and self.data['state'] in ('left_ready', 'left_running'):
+                verify_original(self.repo, self.data['left_source'])
+                for path, state in self.data.get('left_preserved_nested', {}).items():
+                    now = submodule_state(self.repo / path, state['gitlink'], state['parent'])
+                    if any(now[key] != state[key] for key in ('head', 'branch', 'fingerprint')):
+                        raise BenchmarkError('preserved nested submodule changed during A; recovery stopped')
+            original = self.data['original']
+            self.stage('restoring_source')
+            protected_collisions(self.repo, original['head'])
+            checkout(self.repo, original['head'], original['branch'])
+            update_modules(self.repo, restoring=original['submodules'])
+            for path, state in sorted(original['submodules'].items(), key=lambda item: len(PurePosixPath(item[0]).parts)):
+                if not state['head']:
+                    continue
+                directory = self.repo / path
+                reject_in_progress(directory)
+                if tracked_dirty(directory):
+                    raise BenchmarkError('tracked submodule changed; restoration refused')
+                protected_collisions(directory, state['head'])
+                checkout(directory, state['head'], state['branch'])
+            oid = self.data['stash_oid']
+            if oid:
+                self.data['stash_apply_state'] = 'pending'
+                self.save()
+                try:
+                    git_bytes(self.repo, 'stash', 'apply', '--index', oid)
+                except BaseException:
+                    self.data['stash_apply_state'] = 'failed'
+                    self.save()
+                    raise
+                self.data['stash_apply_state'] = 'applied'
+                self.save()
+            current = verify_original(self.repo, original)
+            self.data['new_initializations_retained'] = [path for path, state in current['submodules'].items()
+                if state['head'] and not original['submodules'].get(path, {}).get('head')]
+            self.data['restoration_verified'] = True
+            if oid:
+                # An advisory benchmark lock cannot exclude external Git writers.
+                # Never rewrite refs/reflogs or risk an index-based stash drop race.
+                self.data['stash_dropped'] = False
+                self.data['stash_retained_reason'] = ('external Git concurrency: benchmark advisory lock cannot prove '
+                                                      'atomic ref/reflog drop safety; stash intentionally retained')
+            verify_original(self.repo, original)
+            self.stage('restored')
+
+
+def source_identity_evidence(left, right):
+    """Compare source bytes/actual modules, not branch attachment or log metadata."""
+    def fingerprint(state):
+        value = state.get('fingerprint')
+        return {key: value[key] for key in ('index', 'staged', 'unstaged')
+                if isinstance(value, dict) and value.get(key)}
+    def identity(state):
+        root = {'head': state.get('head'), 'fingerprint': fingerprint(state)}
+        complete = bool(root['head']) and len(root['fingerprint']) == 3
+        modules = state.get('submodules')
+        root['submodules'] = None
+        if not isinstance(modules, dict):
+            return root, False
+        root['submodules'] = {}
+        for path, module in modules.items():
+            head, fp = module.get('head'), fingerprint(module)
+            root['submodules'][path] = {'head': head, 'fingerprint': fp}
+            initialized = bool(head) and len(fp) == 3
+            uninitialized = (module.get('initialization') == 'uninitialized' and
+                             'head' in module and head is None and
+                             'fingerprint' in module and module['fingerprint'] is None)
+            complete = complete and (initialized or uninitialized)
+        return root, complete
+    def changed(a, b):
+        if a['head'] and b['head'] and a['head'] != b['head']:
+            return True
+        return any(a['fingerprint'][key] != b['fingerprint'][key]
+                   for key in a['fingerprint'].keys() & b['fingerprint'].keys())
+    li, lc = identity(left)
+    ri, rc = identity(right)
+    difference = changed(li, ri)
+    lm, rm = li['submodules'], ri['submodules']
+    if lm is not None and rm is not None:
+        difference = difference or lm.keys() != rm.keys() or any(
+            changed(lm[path], rm[path]) for path in lm.keys() & rm.keys())
+    if lc and rc:
+        return 'different' if li != ri else 'same'
+    return 'different' if difference else 'unverified'
+
+
+def sampling_quality_evidence(sampling):
+    sampling = sampling if isinstance(sampling, dict) else {}
+    def finite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:
+            return None
+    count, duration = finite(sampling.get('sample_count')), finite(sampling.get('duration_ms'))
+    count_valid = type(count) is int and count >= 2
+    duration_valid = duration is not None and duration > 0
+    effective = duration / (count - 1) if count_valid and duration_valid else None
+    effective = finite(effective)
+    actual = sampling.get('actual_interval_ms')
+    actual = actual if isinstance(actual, dict) else {}
+    intervals = {key: finite(actual.get(key)) for key in ('min', 'median', 'mean', 'max')}
+    interval_valid = (all(v is not None for v in intervals.values()) and
+                      intervals['min'] >= 0 and all(intervals[k] > 0 for k in ('median', 'mean', 'max')))
+    consistent = False
+    if interval_valid and effective is not None and effective > 0:
+        low, high = intervals['min'], intervals['max']
+        consistent = (low <= intervals['median'] <= high and low <= intervals['mean'] <= high and
+                      high <= duration and math.isclose(intervals['mean'], effective, rel_tol=1e-9, abs_tol=1e-9))
+        if consistent:
+            if count == 2:
+                consistent = len(set(intervals.values())) == 1
+            else:
+                # At least one observed interval realizes each extremum.
+                lower = high + (count - 2) * low
+                upper = low + (count - 2) * high
+                consistent = ((duration >= lower or math.isclose(duration, lower, rel_tol=1e-9, abs_tol=1e-9)) and
+                              (duration <= upper or math.isclose(duration, upper, rel_tol=1e-9, abs_tol=1e-9)))
+                if count == 3:
+                    consistent = consistent and math.isclose(intervals['median'], intervals['mean'],
+                                                             rel_tol=1e-9, abs_tol=1e-9)
+    rows_valid = ('rows' not in sampling or
+                  (type(sampling['rows']) is int and count_valid and sampling['rows'] == count))
+    span_valid = True
+    if 'start_ms' in sampling or 'end_ms' in sampling:
+        start, end = finite(sampling.get('start_ms')), finite(sampling.get('end_ms'))
+        span_valid = (start is not None and end is not None and duration_valid and
+                      math.isclose(end - start, duration, rel_tol=1e-9, abs_tol=1e-9))
+    coverage = sampling.get('coverage')
+    status = coverage.get('status') if isinstance(coverage, dict) else None
+    status = status if isinstance(status, str) else None
+    checks = {'sample_count': count_valid, 'duration': duration_valid,
+              'actual_intervals': interval_valid, 'consistent_intervals': consistent,
+              'rows': rows_valid, 'timestamp_span': span_valid}
+    return {'sample_count': count, 'duration_ms': duration, 'effective_interval_ms': effective,
+            'actual_interval_ms': intervals, 'coverage_status': status, 'checks': checks}
+
+
+def sampling_quality(left, right, tolerance=2.0):
+    tolerance = sampling_quality_tolerance_value(tolerance)
+    evidence = {name: sampling_quality_evidence(side) for name, side in (('left', left), ('right', right))}
+    le, re = evidence['left'], evidence['right']
+    checks = {name + '_metadata': all(side['checks'].values()) for name, side in evidence.items()}
+    coverage = le['coverage_status'], re['coverage_status']
+    checks['coverage'] = coverage[0] in ('complete', 'unverified') and coverage[0] == coverage[1]
+    ratios = {}
+    for name, lv, rv in (('median_interval', le['actual_interval_ms']['median'], re['actual_interval_ms']['median']),
+                         ('max_interval', le['actual_interval_ms']['max'], re['actual_interval_ms']['max']),
+                         ('effective_interval', le['effective_interval_ms'], re['effective_interval_ms'])):
+        ratio = max(lv, rv) / min(lv, rv) if checks['left_metadata'] and checks['right_metadata'] else None
+        ratios[name] = ratio if ratio is not None and math.isfinite(ratio) else None
+        checks[name + '_ratio'] = ratios[name] is not None and ratios[name] <= tolerance
+    evidence['max_min_ratios'] = ratios
+    comparable = all(checks.values())
+    warnings = ['sampling quality checks do not prove continuous-time peaks or sufficient sampling']
+    if coverage == ('unverified', 'unverified'):
+        warnings.append('sampling coverage is unverified on both sides; comparison is descriptive only')
+    if not comparable:
+        warnings.append('memory comparison refused: sampling quality metadata, coverage or interval ratio failed')
+    return {'comparable': comparable, 'status': 'not_comparable' if not comparable else
+                'warning' if coverage == ('unverified', 'unverified') else 'ok',
+            'checks': checks, 'evidence': evidence, 'tolerance': tolerance, 'warnings': warnings}
+
+
+def compare_results(left, right, sampling_quality_tolerance=2.0):
+    checks = {}
+    hard = ('project', 'adapter', 'platform', 'debug_mode', 'mode', 'actual_repeat',
+            'input_frames', 'input_digest', 'instrumentation')
+    for key in hard:
+        lv, rv = left['experiment'].get(key), right['experiment'].get(key)
+        checks[key] = lv is not None and lv == rv
+    checks['device'] = bool(left['device'].get('serial')) and left['device'] == right['device']
+    checks['sampling_configuration'] = (left['sampling'].get('configured_period_ms') is not None and
+        left['sampling'].get('configured_period_ms') == right['sampling'].get('configured_period_ms'))
+    checks['deployment'] = all(side.get('validity', {}).get('deployment') == 'verified' for side in (left, right))
+    source_identity = source_identity_evidence(left.get('source', {}), right.get('source', {}))
+    left_hash, right_hash = (side.get('deployment', {}).get('sha256') for side in (left, right))
+    build_observed = right['experiment'].get('full_build_invocation_observed')
+    reused_without_build = (bool(left_hash) and left_hash == right_hash and
+                            build_observed is False and source_identity == 'different')
+    reuse_verified = (bool(left_hash) and bool(right_hash) and isinstance(build_observed, bool) and
+                      source_identity != 'unverified')
+    checks['no_detected_unbuilt_reuse'] = False if reused_without_build else True if reuse_verified else None
+    build_provenance = {'source_identity': source_identity,
+                        'unbuilt_reuse': 'detected' if reused_without_build else
+                            'not_detected' if reuse_verified else 'unverified',
+                        'build_correctness': 'unverified'}
+    checks['measurement'] = left['measurement_valid'] and right['measurement_valid']
+    base = all(checks.values())
+    quality = sampling_quality(left.get('sampling'), right.get('sampling'), sampling_quality_tolerance)
+    rows = []
+    def add(name, lv, rv, comparable, reason=None):
+        status = 'missing' if lv is None or rv is None else 'ok' if comparable else 'not_comparable'
+        delta = rv - lv if status == 'ok' else None
+        rows.append({'metric': name, 'left': lv, 'right': rv, 'status': status,
+                     'reason': reason if status != 'ok' else None, 'delta': delta,
+                     'delta_percent': delta / lv * 100 if delta is not None and lv != 0 else None})
+    for function in sorted(set(left['performance']) | set(right['performance'])):
+        lm, rm = left['performance'].get(function, {}), right['performance'].get(function, {})
+        def verified(metric, side):
+            counts, composition = metric.get('iteration_counts'), metric.get('iteration_composition')
+            calls = metric.get('calls_per_iteration')
+            return (metric.get('status') == 'ok' and metric.get('coverage') == 'complete' and
+                    isinstance(calls, int) and calls > 0 and isinstance(counts, list) and
+                    counts == [calls] * side['experiment'].get('actual_repeat', 0) and
+                    isinstance(composition, list) and len(composition) == len(counts) and
+                    all(len(names) == calls and names == composition[0] for names in composition) and
+                    sum(counts) == len(metric.get('samples', [])))
+        compatible = (base and lm.get('source') == rm.get('source') and
+                      verified(lm, left) and verified(rm, right) and
+                      lm['calls_per_iteration'] == rm['calls_per_iteration'] and
+                      lm['iteration_composition'] == rm['iteration_composition'])
+        ls = sample_statistics(lm['samples']) if lm.get('samples') else {}
+        rs = sample_statistics(rm['samples']) if rm.get('samples') else {}
+        for stat in ('all_mean_ms', 'median_ms', 'first_ms', 'subsequent_mean_ms', 'min_ms', 'max_ms', 'trimmed_mean_ms'):
+            add('performance.' + function + '.' + stat, ls.get(stat), rs.get(stat), compatible,
+                'configuration, timing source, iteration coverage or invocation composition mismatch')
+    for component in MEMORY_COLUMNS:
+        metrics = ['sampled_peak', 'sample_mean'] + (['getrusage_high_water'] if component == 'rss' else [])
+        for metric in metrics:
+            lm = left['memory'].get(component, {}).get(metric, {})
+            rm = right['memory'].get(component, {}).get(metric, {})
+            compatible = (base and quality['comparable'] and lm.get('unit') == rm.get('unit') and
+                          lm.get('source') == rm.get('source'))
+            add('memory.' + component + '.' + metric, lm.get('value'), rm.get('value'), compatible,
+                'sampling quality metadata, coverage or interval ratio failed' if not quality['comparable'] else
+                'missing data or configuration/memory unit/column source mismatch')
+    return {'direction': 'right_minus_left', 'comparable': base, 'checks': checks, 'metrics': rows,
+            'build_provenance': build_provenance, 'sampling_quality': quality,
+            'interpretation': 'ordered A then B observational comparison; shared build provenance unverified; no causal/significance claim'}
+
+
+def run_ab(args, active):
+    benchmark_started = time.monotonic()
+    result = new_result('ab')
+    repo = args.repo_root
+    target = git_text(repo, 'rev-parse', '--verify', '--end-of-options', args.ab_test_commit + '^{commit}')
+    reject_in_progress(repo)
+    original = source_snapshot(repo)
+    staged = git_text(repo, 'diff', '--cached', '--raw', '--no-ext-diff')
+    if re.search(r':(?:160000|\d+ 160000)', staged):
+        raise BenchmarkError('staged gitlink modifications are refused')
+    check_modules_clean(repo)
+    check_module_strategy(repo, original['head'])
+    check_module_strategy(repo, target)
+    protected_collisions(repo, target)
+    for path, (mode, _, _) in tree_entries(repo, target).items():
+        if mode == '160000' and path not in original['submodules']:
+            directory = repo / path
+            if directory.exists() and (not directory.is_dir() or any(directory.iterdir())):
+                raise BenchmarkError('new target submodule collides with existing nonempty path; untracked repository retained')
+    if args.input_dir is None:
+        raise BenchmarkError('A/B requires an explicit input directory')
+    args.input_dir = args.input_dir.expanduser().resolve()
+    manifest = build_input_manifest(args.input_dir)
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    work = (args.work_dir or repo / 'temp/native_benchmark').expanduser().resolve() / (timestamp + '_ab')
+    work.mkdir(parents=True, mode=0o700)
+    result['_work_dir'] = str(work)
+    result['artifacts']['summary'] = {'path': str(work / 'summary.json')}
+    result['artifacts']['transaction'] = {'path': str(work / 'ab_transaction.json')}
+    result['source'] = original
+    tx = ABTransaction(repo, active, original, target)
+    args._active_path = active
+    tx.data['artifact_receipt'] = str(work / 'ab_transaction.json')
+    tx.save()
+    left = right = None
+    try:
+        tx.switch()
+        if build_input_manifest(args.input_dir) != manifest:
+            raise BenchmarkError('target checkout changed input manifest; comparison refused')
+        side = copy.deepcopy(args)
+        side.work_dir, side.output_dir, side.trace = work / 'left', work / 'left_output', None
+        tx.stage('left_running')
+        left = execute_single(side)
+        tx.data['left_artifacts'] = left.get('_work_dir')
+        left['role'] = 'target_left'
+        result['primary_error'] = left['primary_error']
+        if left['recovery_error']:
+            raise BenchmarkError('left loop patch restore failed; source checkout recovery stopped')
+    except BaseException as exc:
+        result['primary_error'] = result['primary_error'] or safe_error(exc)
+    finally:
+        tx.data['primary_error'] = result['primary_error']
+        try:
+            if left and left['recovery_error']:
+                raise BenchmarkError('left patch recovery unresolved; manual recovery required')
+            tx.restore()
+        except BaseException as exc:
+            result['recovery_error'] = safe_error(exc)
+            tx.data['recovery_error'] = result['recovery_error']
+            tx.save()
+    if not result['primary_error'] and not result['recovery_error'] and left and left['measurement_valid']:
+        try:
+            if build_input_manifest(args.input_dir) != manifest:
+                raise BenchmarkError('input manifest changed before right run')
+            tx.stage('right_running')
+            side = copy.deepcopy(args)
+            side.work_dir, side.output_dir, side.trace = work / 'right', work / 'right_output', None
+            right = execute_single(side)
+            tx.data['right_artifacts'] = right.get('_work_dir')
+            right['role'] = 'current_worktree_right'
+            result['primary_error'] = right['primary_error']
+            result['recovery_error'] = right['recovery_error']
+            verify_original(repo, original)
+            result['comparison'] = compare_results(left, right, getattr(args, 'sampling_quality_tolerance', 2.0))
+        except BaseException as exc:
+            result['recovery_error'] = result['recovery_error'] or safe_error(exc)
+    result['left'] = public_result(left) if left else None
+    result['right'] = public_result(right) if right else None
+    result['measurement_valid'] = bool(left and right and left['measurement_valid'] and right['measurement_valid'] and
+                                       not result['primary_error'] and not result['recovery_error'])
+    interrupted = (any(side and side['status'] == 'interrupted' for side in (left, right)) or
+                   (result.get('primary_error') or {}).get('type') == 'Interrupted')
+    result['status'] = ('interrupted' if interrupted else 'failed' if not result['measurement_valid'] else
+                        'warning' if any(side['status'] == 'warning' for side in (left, right)) else 'ok')
+    result['exit_code'] = (130 if interrupted else
+        124 if any(side and side['exit_code'] == 124 for side in (left, right)) else
+        1 if not result['measurement_valid'] else max(left['exit_code'], right['exit_code']))
+    result['phase'] = 'complete' if not result['recovery_error'] else 'recovery_failed'
+    result['experiment'].update({'run_id': work.name, 'started_at': tx.data['started_at'],
+                                 'ended_at': utc_now(), 'order': ['target_left', 'current_worktree_right'],
+                                 'output_correctness': 'not_verified', 'build_provenance': 'unverified'})
+    result['validity']['source_restore'] = 'failed' if result['recovery_error'] else 'verified'
+    result['source']['target_head'] = target
+    for key, success in (('native', 'valid'), ('memory', 'valid'), ('deployment', 'verified'), ('host', 'ok'), ('trace', 'ok')):
+        states = [side['validity'].get(key, 'not_run') for side in (left, right) if side]
+        result['validity'][key] = ('warning' if 'warning' in states else success
+                                    if len(states) == 2 and all(s == success for s in states) else 'incomplete')
+    result['warnings'] = [side['role'] + ': ' + warning for side in (left, right) if side
+                          for warning in side.get('warnings', [])]
+    if result.get('comparison'):
+        quality = result['comparison']['sampling_quality']
+        result['warnings'].extend(quality['warnings'])
+        if quality['status'] != 'ok' and result['status'] == 'ok':
+            result['status'] = 'warning'
+    result['experiment']['elapsed_seconds'] = time.monotonic() - benchmark_started
+    if tx.data['stash_oid'] and not tx.data.get('stash_dropped'):
+        reason = tx.data.get('stash_retained_reason', 'restoration unverified; no stash cleanup attempted')
+        result['warnings'].append('transaction stash retained: ' + reason + '; inspect receipt for the exact OID')
+        if result['status'] == 'ok':
+            result['status'] = 'warning'
+    tx.data.update({'primary_error': result['primary_error'], 'recovery_error': result['recovery_error']})
+    try:
+        if not result['recovery_error']:
+            tx.stage('complete')
+        else:
+            tx.save()  # B failure still needs the execution layer's latest recovery pointers.
+    except BaseException as exc:
+        tx.data['receipt_write_error'] = safe_error(exc)
+        result['recovery_error'] = result['recovery_error'] or tx.data['receipt_write_error']
+        tx.data['recovery_error'] = result['recovery_error']
+        for field in ('active_artifacts', 'patch_receipt'):
+            tx.data.pop(field, None)
+        tx.data['execution_pointers_verified'] = False
+        result['measurement_valid'] = False
+        if isinstance(exc, KeyboardInterrupt):
+            result['status'], result['exit_code'] = 'interrupted', 130
+        else:
+            if result['status'] != 'interrupted':
+                result['status'] = 'failed'
+            result['exit_code'] = result['exit_code'] or 1
+        result['phase'] = 'recovery_failed'
+        result['validity']['source_restore'] = 'failed'
+    atomic_json(work / 'ab_transaction.json', tx.data)
+    result['artifacts']['transaction'] = artifact_info(work / 'ab_transaction.json')
+    save_result(result)
+    if not args.json and result.get('comparison'):
+        print('metric | target (left) | current/worktree (right) | delta | delta%')
+        for metric in result['comparison']['metrics']:
+            print(' | '.join(str(metric[key]) if metric[key] is not None else 'N/A'
+                             for key in ('metric', 'left', 'right', 'delta', 'delta_percent')))
+    return result
+
+
+def main(argv=None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    json_mode = '--json' in arguments
+    result = new_result('ab' if any(a.startswith('--ab') for a in arguments) else 'single')
+    old_umask = os.umask(0o077)
+    try:
+        with redirect_stdout(sys.stderr) if json_mode else nullcontext():
+            args = build_parser().parse_args(arguments)
+            if args.self_test:
+                self_test()
+                result.update({'status': 'ok', 'exit_code': 0, 'phase': 'self_test'})
+            else:
+                for command in ('git', 'bash', 'adb'):
+                    if not shutil.which(command):
+                        raise BenchmarkError('required command missing from PATH: ' + command + '; install it before running')
+                script, supplied_run_args, _ = parse_run_command(args)
+                if not script:
+                    raise BenchmarkError('provide a run script and adapter/input arguments')
+                # The execution layer receives the original script arguments, not its path again.
+                args.run_command = supplied_run_args or []
+                args.run_script = script.expanduser().resolve()
+                args.repo_root = (args.repo_root.expanduser().resolve() if args.repo_root else
+                                  args.run_script.parent.parent if args.run_script.parent.name == 'scripts' else Path.cwd())
+                with benchmark_lock(args.repo_root) as git_dir:
+                    active = git_dir / 'siq-benchmark-transaction.json'
+                    if active.exists() and json.loads(active.read_text()).get('state') != 'complete':
+                        raise BenchmarkError('unfinished benchmark transaction; inspect siq-benchmark-transaction.json and recover manually')
+                    if args.ab_test_commit:
+                        # Fail before any stash/checkout when the selected device is unavailable.
+                        git_text(args.repo_root, 'rev-parse', '--verify', '--end-of-options',
+                                 args.ab_test_commit + '^{commit}')
+                        device_env = os.environ.copy()
+                        if args.serial:
+                            device_env['ANDROID_SERIAL'] = args.serial
+                        elif device_env.get('ADB_SERIAL') and not device_env.get('ANDROID_SERIAL'):
+                            device_env['ANDROID_SERIAL'] = device_env['ADB_SERIAL']
+                        result['device'] = collect_device(shutil.which('adb'), device_env)
+                        args.serial = result['device']['serial']
+                        result = run_ab(args, active)
+                    else:
+                        atomic_json(active, {'kind': 'single', 'state': 'running',
+                                             'source': source_snapshot(args.repo_root), 'started_at': utc_now()})
+                        args._active_path = active
+                        result = execute_single(args)
+                        if not result['recovery_error']:
+                            atomic_json(active, {'kind': 'single', 'state': 'complete'})
+    except BaseException as exc:
+        if isinstance(exc, SystemExit) and exc.code == 0:
+            result.update({'status': 'ok', 'exit_code': 0})
+        else:
+            result.update({'status': 'interrupted' if isinstance(exc, KeyboardInterrupt) else 'failed',
+                           'exit_code': 130 if isinstance(exc, KeyboardInterrupt) else 1,
+                           'primary_error': safe_error(exc)})
+    finally:
+        os.umask(old_umask)
+    save_result(result)
+    if json_mode:
+        print(json.dumps(public_result(result), ensure_ascii=False, allow_nan=False))
+    if result.get('primary_error'):
+        print('[error] ' + result['primary_error']['message'], file=sys.stderr)
+    if result.get('recovery_error'):
+        print('[recovery error] ' + result['recovery_error']['message'], file=sys.stderr)
+    return result['exit_code']
 
 
 if __name__ == "__main__":
-    try:
-        with interruption_cleanup():
-            raise SystemExit(main())
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"command failed with exit {exc.returncode}: {shlex.join(exc.cmd)}") from exc
-    except RuntimeError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+    with interruption_cleanup():
+        raise SystemExit(main())
