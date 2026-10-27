@@ -49,6 +49,33 @@ assert.equal(gate.candidate, null);
 const rateError = 'Error: Retry failed after 3 attempts: OpenAI API error (429): {"message":"Rate limit exceeded\n [trace_id=synthetic\n code=20011]","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}';
 const quotaError = 'Error: OpenAI API error (402): {"message":"API Key quota has been exhausted. | Used 2001 of\n 2000 in the current cycle.","type":"insufficient_quota","code":api_key_quota_exhausted"}';
 const fail = errorMessage => ({ messages: [{ role: 'assistant', stopReason: 'error', errorMessage }] });
+const poolMessage = 'No budget pool with available quota could be selected. | No budget pool bound to this API Key currently has available quota. | Check the budget pool status and quota.\n  [trace_id=synthetic code=40005]';
+const poolError = ` Error: OpenAI API error (402): ${JSON.stringify({ message: poolMessage, type: 'insufficient_quota', param: null, code: 'quota_unavailable' }).replace(/\\n/g, '\n')}`;
+const poolErrors = [
+  poolError,
+  poolError.replace('Check the budget pool status and quota.', 'rate_limit_exceeded; Our servers are currently overloaded. Please try again later.'),
+  poolError.replace('Error: ', 'Error: Retry failed after 3 attempts: '),
+  'OpenAI API error (402): {"code":"quota_unavailable"}',
+  'OpenAI API error (402): {"type":"insufficient_quota"}',
+  'OpenAI API error (402): {"message":"No budget pool with available quota could be selected."}',
+  'OpenAI API error (402): {"message":"No budget pool bound to this API Key currently has available quota."}',
+];
+for (const message of poolErrors) {
+  for (const suffix of ['', '\n' + rateError + '\n' + failure.messages[0].errorMessage]) {
+    const poolGate = new RecoveryGate(() => time);
+    poolGate.end(fail(message + suffix)); poolGate.settle(); time += 60001;
+    assert.equal(poolGate.candidate, 'quota-exhausted');
+    for (const safety of [null, safe]) {
+      assert.deepEqual(poolGate.status(ctx, safety), { recovery: 'quota-exhausted', eligible: false });
+      poolGate.recover({ sendUserMessage: () => assert.fail('budget pool quota must never send') }, ctx, safety);
+    }
+    // Only the final assistant error matters; a new transient run may recover.
+    poolGate.end({ messages: [...fail(message).messages, ...fail(rateError).messages] });
+    poolGate.settle(); time += 3001;
+    assert.equal(poolGate.candidate, 'rate-limit');
+    assert.equal(poolGate.status(ctx, safe).eligible, true);
+  }
+}
 // Settlement is required, even after the native retry budget is exhausted.
 time += 60000;
 gate.end(fail(rateError));
@@ -69,7 +96,9 @@ for (const message of [quotaError, quotaError + '\nrate_limit_exceeded\n' + fail
   assert.equal(gate.status(ctx, safe).recovery, 'quota-exhausted');
   gate.recover({ sendUserMessage: () => assert.fail('quota must never send') }, ctx, safe);
 }
-for (const message of ['API Key quota has been exhausted', 'OpenAI API error (402): unrelated',
+for (const message of ['API Key quota has been exhausted', 'quota_unavailable', 'insufficient_quota',
+                       poolError.replace('(402)', '(500)'), poolError.replace('(402)', '(401)'),
+                       'OpenAI API error (402): unrelated',
                        'Error: OpenAI API error (500): unrelated']) {
   gate.end(fail(message));
   assert.equal(gate.status(ctx, safe).recovery, 'no-candidate');
@@ -114,6 +143,10 @@ try {
   assert.equal((await request(meta, { cap: 'x'.repeat(64) })).code, 403);
   assert.equal((await request(meta, { op: 'prompt', prompt: 'anything' })).code, 403);
   assert.equal((await request(meta, { op: 'recover' })).data.eligible, false);
+  handlers.get('agent_end')(fail(poolError), ctx); handlers.get('agent_settled')({}, ctx);
+  for (const op of ['status', 'recover']) {
+    assert.deepEqual((await request(meta, { op })).data, { recovery: 'quota-exhausted', eligible: false });
+  }
   const nonce = Date.now().toString(16).padStart(12, '0') + 'a'.repeat(20);
   assert.equal((await request(meta, {}, nonce)).code, 200);
   assert.equal((await request(meta, {}, nonce)).code, 403);

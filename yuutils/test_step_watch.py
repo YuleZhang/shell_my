@@ -31,6 +31,10 @@ QUOTA = ('Error: OpenAI API error (402): {"message":"API Key quota has been exha
 MULTILINE_QUOTA = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted. '
                    '| Used 2001 of\n 2000 in the current cycle.","type":"insufficient_quota",'
                    '"code":api_key_quota_exhausted"}')
+POOL_QUOTA = (' Error: OpenAI API error (402): {"message":"No budget pool with available quota '
+              'could be selected. | No budget pool bound to this API Key currently has available quota. '
+              '| Check the budget pool status and quota.\n  [trace_id=synthetic code=40005]",'
+              '"type":"insufficient_quota","param":null,"code":"quota_unavailable"}')
 FOOTER = '\n Warning: Autopilot stopped after reaching its retry limit\n' + PROMPT
 FAKE = '''#!/usr/bin/env python3
 import json, os, select, sys, termios, time, tty
@@ -117,6 +121,26 @@ sys.exit(7)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_budget_pool_quota_denied_and_new_run_can_recover(self):
+        errors = [POOL_QUOTA, POOL_QUOTA.replace('Error: ', 'Error: Retry failed after 3 attempts: '),
+                  'Error: OpenAI API error (402): {"code":"quota_unavailable"}',
+                  'Error: OpenAI API error (402): {"type":"insufficient_quota"}',
+                  'Error: OpenAI API error (402): {"message":"No budget pool with available quota could be selected."}',
+                  'Error: OpenAI API error (402): {"message":"No budget pool bound to this API Key currently has available quota."}']
+        for error in errors:
+            for message in (error, error.replace('}', ',"detail":"rate_limit_exceeded; '
+                                                'Our servers are currently overloaded. Please try again later."}')):
+                with self.subTest(message=message):
+                    screen = message + FOOTER
+                    self.assertEqual(w.terminal_failure(screen), 'quota exhausted')
+                    gate = w.RecoveryGate(.3, 0)
+                    gate.output(screen, 10)
+                    self.assertIsNone(gate.ready(screen, 100))
+                    self.assertEqual(w.terminal_failure(screen + '\n› continue\n' + RATE + FOOTER), 'rate limit')
+            self.assertIsNone(w.terminal_failure(error.replace('(402)', '(500)') + FOOTER))
+        for error in ('quota_unavailable', 'Error: OpenAI API error (402): {"message":"unrelated"}'):
+            self.assertIsNone(w.terminal_failure(error + FOOTER))
+
     def test_wrapped_api_failures_and_quota_priority(self):
         rate = ('Error: Retry failed after 3 attempts: OpenAI API error (429): '
                 '{"message":"Rate limit exceeded\n [trace_id=synthetic\n code=20011]",'
@@ -280,7 +304,7 @@ class ScreenTests(unittest.TestCase):
         for columns in (60, 80, 100):
             for error, reason in ((ERROR, 'overload'), (RATE, 'rate limit'),
                                   (MULTILINE_RATE, 'rate limit'), (QUOTA, 'quota exhausted'),
-                                  (MULTILINE_QUOTA, 'quota exhausted')):
+                                  (MULTILINE_QUOTA, 'quota exhausted'), (POOL_QUOTA, 'quota exhausted')):
                 with self.subTest(columns=columns, error=error):
                     screen, _ = self.render(error + FOOTER, columns)
                     self.assertEqual(screen.logical_display().splitlines(),
@@ -442,7 +466,7 @@ class PtyTests(unittest.TestCase):
 
     def test_real_80_column_pty_rate_and_quota(self):
         for error, expected in ((RATE, b'continue\r'), (MULTILINE_RATE, b'continue\r'),
-                                (QUOTA, b''), (MULTILINE_QUOTA, b'')):
+                                (QUOTA, b''), (MULTILINE_QUOTA, b''), (POOL_QUOTA, b'')):
             with self.subTest(error=error):
                 (self.root / 'report').unlink(missing_ok=True)
                 Path(self.env['REPORT'] + '.reserve').unlink(missing_ok=True)
