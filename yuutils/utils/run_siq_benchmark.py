@@ -1394,12 +1394,14 @@ def collect_device(adb: str, env: dict[str, str], transport_id: int | None = Non
     if devices.returncode != 0:
         raise RuntimeError('adb devices query failed')
     rows = [line.split() for line in devices.stdout.splitlines()[1:] if line.strip()]
+    selector = env.get('ANDROID_SERIAL') or env.get('ADB_SERIAL')
+    def matches_selector(row):
+        return not selector or selector == row[0] or selector in row[2:]
     selected = [row for row in rows if len(row) >= 3 and row[1] == 'device' and
                 any(field == f'transport_id:{transport_id}' for field in row[2:])]
     if transport_id is None:
-        serial = env.get('ANDROID_SERIAL') or env.get('ADB_SERIAL')
         selected = [row for row in rows if len(row) >= 3 and row[1] == 'device' and
-                    (not serial or row[0] == serial)]
+                    matches_selector(row)]
     if len(selected) != 1:
         raise RuntimeError('select one adb connection using --transport-id (adb devices -l)')
     row = selected[0]
@@ -1415,7 +1417,7 @@ def collect_device(adb: str, env: dict[str, str], transport_id: int | None = Non
     serial = query(['get-serialno'])
     if not serial or serial == 'unknown':
         raise RuntimeError('selected adb connection has no serial')
-    if serial != row[0] or (env.get('ANDROID_SERIAL') and serial != env['ANDROID_SERIAL']):
+    if serial != row[0] or not matches_selector(row):
         raise RuntimeError('selected adb connection does not match requested serial')
     return {'serial': serial, 'adb_server_socket': env.get('ADB_SERVER_SOCKET'),
             'transport_id': int(transport),
