@@ -836,6 +836,23 @@ class GitFixtureTest(unittest.TestCase):
         args.work_dir = self.base / 'artifacts'
         return args
 
+    def test_recovered_single_transaction_is_unblocked_only_after_restore_verifies(self):
+        receipt = self.base / 'source_patch.json'
+        receipt.write_text(json.dumps({'restored': True, 'exact_restore': True}))
+        record = {'kind': 'single', 'state': 'running',
+                  'source': b.source_snapshot(self.repo), 'patch_receipt': str(receipt)}
+        self.active.write_text(json.dumps(record))
+        (self.repo / 'source').write_text('concurrent edit\n')
+        self.assertFalse(b.finish_recovered_single(self.repo, self.active))
+        self.assertEqual(json.loads(self.active.read_text())['state'], 'running')
+        (self.repo / 'source').write_text('current\n')
+        receipt.write_text(json.dumps({'restored': False, 'exact_restore': False}))
+        self.assertFalse(b.finish_recovered_single(self.repo, self.active))
+        receipt.write_text(json.dumps({'restored': True, 'exact_restore': True}))
+        self.assertTrue(b.finish_recovered_single(self.repo, self.active))
+        self.assertEqual(json.loads(self.active.read_text())['state'], 'complete')
+        self.assertTrue(json.loads(self.active.read_text())['recovery_verified'])
+
     def test_real_stash_index_untracked_branch_and_existing_user_stash(self):
         (self.repo / 'source').write_text('user stash\n')
         self.git(self.repo, 'stash', 'push', '-m', 'user entry')

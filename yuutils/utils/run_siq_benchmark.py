@@ -2621,6 +2621,25 @@ def verify_original(repo, original):
     return current
 
 
+def finish_recovered_single(repo, active):
+    record = json.loads(active.read_text())
+    if record.get('kind') != 'single' or record.get('state') != 'running':
+        return False
+    receipt_path = record.get('patch_receipt')
+    if not receipt_path or not Path(receipt_path).is_file():
+        return False
+    receipt = json.loads(Path(receipt_path).read_text())
+    if not receipt.get('restored') or not receipt.get('exact_restore'):
+        return False
+    try:
+        verify_original(repo, record['source'])
+    except (BenchmarkError, KeyError):
+        return False
+    record.update(state='complete', recovered_at=utc_now(), recovery_verified=True)
+    atomic_json(active, record)
+    return True
+
+
 class ABTransaction:
     def __init__(self, repo, receipt, original, target):
         self.repo, self.path = repo, receipt
@@ -3089,7 +3108,8 @@ def main(argv=None) -> int:
                                   args.run_script.parent.parent if args.run_script.parent.name == 'scripts' else Path.cwd())
                 with benchmark_lock(args.repo_root) as git_dir:
                     active = git_dir / 'siq-benchmark-transaction.json'
-                    if active.exists() and json.loads(active.read_text()).get('state') != 'complete':
+                    if active.exists() and json.loads(active.read_text()).get('state') != 'complete' and \
+                            not finish_recovered_single(args.repo_root, active):
                         raise BenchmarkError('unfinished benchmark transaction; inspect siq-benchmark-transaction.json and recover manually')
                     if args.ab_test_commit:
                         # Fail before any stash/checkout when the selected device is unavailable.
