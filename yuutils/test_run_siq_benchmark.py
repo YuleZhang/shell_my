@@ -33,9 +33,10 @@ Sampling Period: 5 ms
 class MeasurementTest(unittest.TestCase):
     def test_duplicate_adb_serial_requires_transport_and_pins_commands(self):
         devices = ('List of devices attached\n'
-                   'same device model:first transport_id:1\n'
-                   'same device model:second transport_id:2\n')
-        replies = [devices, devices, 'same', 'chip', 'second', '17']
+                   'same device product:first model:first transport_id:1\n'
+                   'same device product:second model:second transport_id:2\n')
+        replies = [devices, devices, 'same', 'chip', 'second', '17',
+                   devices, 'same', 'chip', 'second', '17']
         calls = []
 
         def fake_run(command, **kwargs):
@@ -46,7 +47,8 @@ class MeasurementTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '--transport-id'):
                 b.collect_device('adb', {'ANDROID_SERIAL': 'same'})
             self.assertEqual(2, b.collect_device('adb', {'ANDROID_SERIAL': 'same'}, 2)['transport_id'])
-        self.assertTrue(all(command[1:3] == ['-t', '2'] for command in calls[2:]))
+            self.assertEqual(2, b.collect_device('adb', {'ANDROID_SERIAL': 'product:second'})['transport_id'])
+        self.assertTrue(all(command[1:3] == ['-t', '2'] for command in calls[2:6] + calls[7:]))
 
         with mock.patch.dict(os.environ, {'_BENCH_REAL_ADB': '/real/adb',
                                           '_BENCH_TRANSPORT_ID': '2'}), \
