@@ -270,6 +270,9 @@ def tool_wrapper_main(tool: str, args: list[str]) -> int:
             emit_stage('build SDK', 'end', result.returncode)
             return result.returncode if result.returncode >= 0 else 128 - result.returncode
     elif tool == 'adb':
+        transport_id = os.environ.get('_BENCH_TRANSPORT_ID')
+        if transport_id and '-t' not in args:
+            args = ['-t', transport_id, *args]
         if 'logcat' in args and 'shell' not in args and 'exec-out' not in args and args[-1] == 'logcat':
             args.append('-d')
         idx = next((i for i, arg in enumerate(args) if arg in ('shell', 'exec-out')), None)
@@ -1384,18 +1387,38 @@ def git_dirty(repo_root: Path) -> bool:
     return bool(result.stdout.strip())
 
 
-def collect_device(adb: str, env: dict[str, str]) -> dict:
+def collect_device(adb: str, env: dict[str, str], transport_id: int | None = None) -> dict:
     """Only the selected device and a fixed property whitelist, never all getprop."""
+    devices = subprocess.run([adb, 'devices', '-l'], env=env, capture_output=True,
+                             text=True, timeout=15)
+    if devices.returncode != 0:
+        raise RuntimeError('adb devices query failed')
+    rows = [line.split() for line in devices.stdout.splitlines()[1:] if line.strip()]
+    selected = [row for row in rows if len(row) >= 3 and row[1] == 'device' and
+                any(field == f'transport_id:{transport_id}' for field in row[2:])]
+    if transport_id is None:
+        serial = env.get('ANDROID_SERIAL') or env.get('ADB_SERIAL')
+        selected = [row for row in rows if len(row) >= 3 and row[1] == 'device' and
+                    (not serial or row[0] == serial)]
+    if len(selected) != 1:
+        raise RuntimeError('select one adb connection using --transport-id (adb devices -l)')
+    row = selected[0]
+    transport = next(field.split(':', 1)[1] for field in row[2:]
+                     if field.startswith('transport_id:'))
+    target = ['-t', transport]
     def query(arguments):
-        result = subprocess.run([adb, *arguments], env=env, capture_output=True,
+        result = subprocess.run([adb, *target, *arguments], env=env, capture_output=True,
                                 text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError('device identity query failed')
         return result.stdout.strip()
     serial = query(['get-serialno'])
     if not serial or serial == 'unknown':
-        raise RuntimeError('select one adb device using --serial')
+        raise RuntimeError('selected adb connection has no serial')
+    if serial != row[0] or (env.get('ANDROID_SERIAL') and serial != env['ANDROID_SERIAL']):
+        raise RuntimeError('selected adb connection does not match requested serial')
     return {'serial': serial, 'adb_server_socket': env.get('ADB_SERVER_SOCKET'),
+            'transport_id': int(transport),
             'soc': query(['shell', 'getprop', 'ro.soc.model']),
             'model': query(['shell', 'getprop', 'ro.product.model']),
             'android_version': query(['shell', 'getprop', 'ro.build.version.release'])}
@@ -1516,6 +1539,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="repeat_full=create_process_release x N; repeat_process=create + process x N + release (default)",
     )
     parser.add_argument("--serial", default=None, help="ADB serial; defaults to ANDROID_SERIAL.")
+    parser.add_argument("--transport-id", type=positive_int,
+                        help="ADB transport ID from adb devices -l; required when serials collide.")
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument(
         "--adbsync-env",
@@ -1711,8 +1736,9 @@ def run_single(args, result) -> int:
         env["ANDROID_SERIAL"] = args.serial
     elif env.get("ADB_SERIAL") and not env.get("ANDROID_SERIAL"):
         env["ANDROID_SERIAL"] = env["ADB_SERIAL"]
-    result['device'] = collect_device(real_adb, env)
+    result['device'] = collect_device(real_adb, env, args.transport_id)
     env['ANDROID_SERIAL'] = result['device']['serial']
+    env['_BENCH_TRANSPORT_ID'] = str(result['device']['transport_id'])
     print('[stage] selected adb device identity verified', file=sys.stderr, flush=True)
 
     run_script, supplied_run_args, _ = parse_run_command(args)
@@ -1922,7 +1948,7 @@ def run_single(args, result) -> int:
         if use_adbsync:
             cleanup_exit = run_logged(
                 [
-                    real_adb,
+                    real_adb, '-t', env['_BENCH_TRANSPORT_ID'],
                     "shell",
                     "rm",
                     "-rf",
@@ -2010,7 +2036,7 @@ def run_single(args, result) -> int:
         csv_local = csv_dir / Path(csv_remote).name
         pull_log = work_dir / f"adb_pull_{index:02d}.log"
         pull_exit = run_logged(
-            [real_adb, "pull", csv_remote, str(csv_local)],
+            [real_adb, '-t', env['_BENCH_TRANSPORT_ID'], "pull", csv_remote, str(csv_local)],
             repo_root,
             env,
             pull_log,
@@ -2029,7 +2055,7 @@ def run_single(args, result) -> int:
                 PurePosixPath(deployment["input_remote_dir"]).parent / "output" / "mem_use_info.csv"
             )
             pull_exit = run_logged(
-                [real_adb, "pull", str(moved_remote), str(csv_local)],
+                [real_adb, '-t', env['_BENCH_TRANSPORT_ID'], "pull", str(moved_remote), str(csv_local)],
                 repo_root,
                 env,
                 work_dir / f"adb_pull_{index:02d}_relocated.log",
@@ -3074,8 +3100,9 @@ def main(argv=None) -> int:
                             device_env['ANDROID_SERIAL'] = args.serial
                         elif device_env.get('ADB_SERIAL') and not device_env.get('ANDROID_SERIAL'):
                             device_env['ANDROID_SERIAL'] = device_env['ADB_SERIAL']
-                        result['device'] = collect_device(shutil.which('adb'), device_env)
+                        result['device'] = collect_device(shutil.which('adb'), device_env, args.transport_id)
                         args.serial = result['device']['serial']
+                        args.transport_id = result['device']['transport_id']
                         result = run_ab(args, active)
                     else:
                         atomic_json(active, {'kind': 'single', 'state': 'running',

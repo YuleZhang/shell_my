@@ -31,6 +31,29 @@ Sampling Period: 5 ms
 
 
 class MeasurementTest(unittest.TestCase):
+    def test_duplicate_adb_serial_requires_transport_and_pins_commands(self):
+        devices = ('List of devices attached\n'
+                   'same device model:first transport_id:1\n'
+                   'same device model:second transport_id:2\n')
+        replies = [devices, devices, 'same', 'chip', 'second', '17']
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, replies.pop(0), '')
+
+        with mock.patch.object(b.subprocess, 'run', side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, '--transport-id'):
+                b.collect_device('adb', {'ANDROID_SERIAL': 'same'})
+            self.assertEqual(2, b.collect_device('adb', {'ANDROID_SERIAL': 'same'}, 2)['transport_id'])
+        self.assertTrue(all(command[1:3] == ['-t', '2'] for command in calls[2:]))
+
+        with mock.patch.dict(os.environ, {'_BENCH_REAL_ADB': '/real/adb',
+                                          '_BENCH_TRANSPORT_ID': '2'}), \
+             mock.patch.object(b.os, 'execv') as execv:
+            b.tool_wrapper_main('adb', ['shell', 'true'])
+        execv.assert_called_once_with('/real/adb', ['/real/adb', '-t', '2', 'shell', 'true'])
+
     def csv_file(self, text):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -1180,7 +1203,7 @@ class GitFixtureTest(unittest.TestCase):
         argv = ['--json', '--ab_test_commit', self.old, '--repo-root', str(self.repo),
                 '--run-script', str(self.repo / 'run.sh'), '--input-dir', str(self.input),
                 '--adapter', 'fixture']
-        with mock.patch.object(b, 'collect_device', return_value={'serial': 'fixed-fixture'}), \
+        with mock.patch.object(b, 'collect_device', return_value={'serial': 'fixed-fixture', 'transport_id': 1}), \
                 mock.patch.object(b, 'run_ab', side_effect=run), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(b.main(argv), 0)
@@ -1481,7 +1504,7 @@ class GitFixtureTest(unittest.TestCase):
                 '--work-dir', str(self.base / 'positional-artifacts')]
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(b, 'run_logged', logged), \
-                mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture'}), \
+                mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
                 mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = b.main(argv)
@@ -1507,7 +1530,7 @@ class GitFixtureTest(unittest.TestCase):
             result = b.new_result('ab')
             result.update(status='ok', exit_code=0)
             return result
-        with mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture'}), \
+        with mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
                 mock.patch.object(b, 'run_ab', side_effect=run), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(b.main(argv), 0)
@@ -1521,7 +1544,7 @@ class GitFixtureTest(unittest.TestCase):
         argv, logged = self.fake_single(host_exit=1)
         before = b.source_snapshot(self.repo)
         stdout, stderr = io.StringIO(), io.StringIO()
-        with mock.patch.object(b, 'run_logged', logged), mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture'}), \
+        with mock.patch.object(b, 'run_logged', logged), mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
                 mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = b.main(argv)
@@ -1547,7 +1570,7 @@ class GitFixtureTest(unittest.TestCase):
     def test_relocated_csv_keeps_both_pull_attempt_logs(self):
         argv, logged = self.fake_single(pull_relocated=True)
         stdout = io.StringIO()
-        with mock.patch.object(b, 'run_logged', logged), mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture'}), \
+        with mock.patch.object(b, 'run_logged', logged), mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
                 mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), contextlib.redirect_stdout(stdout):
             b.main(argv)
         result = json.loads(stdout.getvalue())
