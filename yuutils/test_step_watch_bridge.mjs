@@ -76,6 +76,42 @@ for (const message of poolErrors) {
     assert.equal(poolGate.status(ctx, safe).eligible, true);
   }
 }
+// No HTTP status, a non-429 status, or quoted historical 429 must fail closed.
+const deniedRates = [
+  'rate_limit_exceeded',
+  'Rate limit exceeded',
+  ...[402, 401, 500].flatMap(status => [
+    `Error: OpenAI API error (${status}): {"code":"rate_limit_exceeded"}`,
+    `Error: OpenAI API error (${status}): {"message":"Rate limit exceeded"}`,
+  ]),
+  'Error: OpenAI API error (402): {"message":"Previous OpenAI API error (429): Rate limit exceeded"}',
+  'Unrecognized error: OpenAI API error (429): {"code":"rate_limit_exceeded"}',
+  'Error: OpenAI API error (429): unrelated rate_limit_exceeded',
+  'Error: OpenAI API error (429): {"message":"unrelated"}',
+  'Error: OpenAI API error (429): {"message":"unrelated rate_limit_exceeded"}',
+  'Error: OpenAI API error (429): {"message":"quoted \\"code\\":\\"rate_limit_exceeded\\""}',
+  'Error: OpenAI API error (429): {"code":rate_limit_exceeded}',
+  'Error: OpenAI API error (429): {"error":{"code":"rate_limit_exceeded"}}',
+  'Error: Retry failed after 3 attempts: OpenAI API error (402): {"code":"rate_limit_exceeded"}',
+];
+for (const message of deniedRates) {
+  const deniedGate = new RecoveryGate(() => time);
+  deniedGate.end(fail(message)); deniedGate.settle(); time += 60001;
+  assert.equal(deniedGate.candidate, null, message);
+  assert.deepEqual(deniedGate.status(ctx, safe), { recovery: 'no-candidate', eligible: false });
+  let deniedSends = 0;
+  deniedGate.recover({ sendUserMessage: () => { deniedSends++; } }, ctx, safe);
+  assert.equal(deniedSends, 0);
+}
+for (const message of [rateError, rateError.replace('Error: Retry failed after 3 attempts: ', ''),
+                       'Error: OpenAI API error (429): {"code":"rate_limit_exceeded"}',
+                       'Error: OpenAI API error (429): {"type":"rate_limit_exceeded"}',
+                       'Error: OpenAI API error (429): {"message":"Rate limit exceeded"}']) {
+  const rateGate = new RecoveryGate(() => time);
+  rateGate.end(fail(message)); rateGate.settle(); time += 3001;
+  assert.equal(rateGate.candidate, 'rate-limit', message);
+  assert.equal(rateGate.status(ctx, safe).eligible, true);
+}
 // Settlement is required, even after the native retry budget is exhausted.
 time += 60000;
 gate.end(fail(rateError));
@@ -106,8 +142,10 @@ for (const message of ['API Key quota has been exhausted', 'quota_unavailable', 
 gate.end(fail(rateError)); gate.end({ messages: [{ role: 'assistant', stopReason: 'stop' }] });
 gate.settle(); time += 3001;
 assert.equal(gate.status(ctx, safe).recovery, 'no-candidate');
-gate.end(fail('rate_limit_exceeded')); gate.settle(); time += 60001;
-gate.recover({ sendUserMessage: () => { throw Error('private'); } }, ctx, safe);
+gate.end(fail(rateError)); gate.settle(); time += 60001;
+let failedSends = 0;
+gate.recover({ sendUserMessage: () => { failedSends++; throw Error('private'); } }, ctx, safe);
+assert.equal(failedSends, 1);
 assert.equal(gate.candidate, null);
 assert.equal(gate.recover({}, ctx, safe).eligible, false);
 gate.cancel();

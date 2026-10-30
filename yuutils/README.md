@@ -9,7 +9,7 @@ Shell 与设备工具合集。它包含 `adb-sync`、可替换 `adb` 前端、SI
 日常安装使用现有作者 pip server，无需克隆仓库或启动新的 agent 对话：
 
 ```bash
-python3 -m pip install --upgrade "yuutils==1.5.3" \
+python3 -m pip install --upgrade "yuutils==1.5.4" \
     --extra-index-url http://10.168.248.83:8080/simple/ \
     --trusted-host 10.168.248.83
 ```
@@ -25,17 +25,17 @@ run_siq_benchmark.py --self-test
 该服务仅用于受信的内部网络；不要在不可信网络中使用明文 HTTP 安装。由于服务是
 HTTP 索引，必须传入 `--trusted-host`。客户端需要能够访问 `10.168.248.83:8080`；
 无法访问时请联系作者确认当前网络地址。Python 运行时依赖为 `tabulate`（性能表格）
-和 `pyte>=0.8.2,<0.9`（PTY 屏幕解析），pip 自动安装。yuutils 1.5.3 要求 Python
+和 `pyte>=0.8.2,<0.9`（PTY 屏幕解析），pip 自动安装。yuutils 1.5.4 要求 Python
 3.8 或更高版本。正式发布产物提供 `SHA256SUMS`，从 GitHub 手动下载时应先核对校验和。
 
 GitHub Release 可作为备用下载入口：
 
-- <https://github.com/YuleZhang/shell_my/releases/tag/yuutils-v1.5.3>
+- <https://github.com/YuleZhang/shell_my/releases/tag/yuutils-v1.5.4>
 
 下载 wheel 后可以离线安装：
 
 ```bash
-python3 -m pip install ./yuutils-1.5.3-py3-none-any.whl
+python3 -m pip install ./yuutils-1.5.4-py3-none-any.whl
 ```
 
 ## SIQ benchmark 工具链
@@ -254,15 +254,16 @@ source "$(adb-sync-env)" off
 
 `adb-sync` 本身仍保持独立版本与测试；yuutils 版本表示本次工具集合快照的版本。
 
-## 会话恢复监控（1.5.3）
+## 会话恢复监控（1.5.4）
 
 1.5.1 默认是前台新 PTY，**不是监控已有会话的后台服务**。1.5.2 默认改为当前 UID
 后台 daemon：打印 PID 和监控范围后返回 shell，不创建对话、不打开其他 TTY。
-1.5.3 修复 429 自动继续、402 Key 配额禁止和启动诊断，保留已有安全检查。
+1.5.3 修复 429 自动继续、402 Key 配额禁止和启动诊断；1.5.4 收紧 429 错误识别，
+拒绝裸错误码、非 429 状态和正文中引用的历史 429，保留已有安全检查。
 已有未接入的会话需要按下面步骤加载桥接；未验证的版本和后端会显示原因，不会假报可自动回复。
 
 ```bash
-python3 -m pip install -U 'yuutils==1.5.3' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && step-watch start
+python3 -m pip install -U 'yuutils==1.5.4' --extra-index-url http://10.168.248.83:8080/simple/ --trusted-host 10.168.248.83 && step-watch start
 step-watch status
 step-watch log
 step-watch stop
@@ -296,8 +297,10 @@ Linux `/proc`、Unix socket/SO_PEERCRED 和已安装的 native Step 扩展接口
   `da9218ed201419a93cd233adb203743657fe497fee15117e768d2c9438dd3ae5`
   的 Linux native ELF。其他二进制、RPC、SDK、自定义 editor factory 或未知 UI
   显示 `ui-safety-unavailable`，不允许通过用户“verified”标志绕过。
-- **429 自动恢复**：识别 `rate_limit_exceeded` 和换行的 `OpenAI API error (429)` /
-  `Rate limit exceeded`；内置 retry / autopilot 耗尽且原生回合 settled 后，按上述安全规则
+- **429 自动恢复**：错误头必须明确为 `OpenAI API error (429)`（可带 `Error:` / retry
+  耗尽包装），且 JSON 顶层 `code` / `type` 为 `rate_limit_exceeded`，或 `message` 以
+  `Rate limit exceeded` 开头；支持终端换行。裸 code、非 429、正文引用的 429 或不能解析的
+  限流错误保持 fail-closed。内置 retry / autopilot 耗尽且原生回合 settled 后，按上述安全规则
   自动发送 `continue`。不再用 wrapper CLI 的 `usage` 余额作为恢复门槛，也不访问凭据。
   每个新失败回合均可恢复，包括相同的 429，但距离上次提交至少 60 秒；同一候选不重复发送。
 - **402 配额 / 预算池额度不可用禁止恢复**：同一错误中 HTTP 402 且包含
@@ -330,7 +333,7 @@ Herdr 本身缺少可靠目标所有权接口，不通过 pane API 注入；其�
 原生版本或编辑器未通过验证。仅记录状态变化，避免每秒重复刷屏；退出进程也会记录。
 启动失败会给出 `extension-conflict`、`private-directory`、`readiness-timeout` 等固定原因和
 处理提示，而不会回显任意异常。旧扩展内容冲突仍不自动覆盖：先人工审阅旧文件，确认替换后
-再安装 1.5.3，运行 `step-watch start` 并在已有会话中 `/reload`；新会话自动加载新桥接。
+再安装 1.5.4，运行 `step-watch start` 并在已有会话中 `/reload`；新会话自动加载新桥接。
 
 ### 显式旧模式
 

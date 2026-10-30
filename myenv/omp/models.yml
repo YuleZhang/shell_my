@@ -3,7 +3,7 @@ providers:
     baseUrl: https://stepcode.basemind.com
     api: anthropic-messages
     disableStrictTools: true
-    apiKey: "!jq -r .apiKey /home/zhangyu/.stepcode/config.json"
+    apiKey: "!jq -r .apiKey \"$HOME/.stepcode/config.json\""
     headers:
       x-source-user: jiigan.com
       X-Origin-Agent: stepcode

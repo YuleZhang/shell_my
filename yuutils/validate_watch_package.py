@@ -23,8 +23,8 @@ def scan(files):
         lower = name.lower()
         if any(part in lower.split('/') for part in ('auth.json', '.env', 'receipt.json', 'daemon.log')):
             raise RuntimeError('private file in artifact')
-        if re.search(rb'(?:sk-[A-Za-z0-9_-]{24,}|-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----)', data):
-            raise RuntimeError('credential marker in artifact')
+        if re.search(rb'(?:sk-[A-Za-z0-9_-]{24,}|-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----|/(?:home|data\d+)/[^/\s]+)', data):
+            raise RuntimeError('credential or author-specific path marker in artifact')
         count += 1
     return count
 
@@ -56,6 +56,10 @@ def main():
                 assert any(member.name.endswith('/' + required) for member in members)
             count += scan((member.name, archive.extractfile(member).read())
                           for member in members if member.isfile())
+            source_manifests = [member for member in members if member.name.endswith('.egg-info/SOURCES.txt')]
+            assert len(source_manifests) == 1
+            sources = archive.extractfile(source_manifests[0]).read().decode('utf-8').splitlines()
+            assert all(not Path(line).is_absolute() for line in sources)
             # Archive just built from this isolated copy; reject escaping paths.
             assert all(not Path(m.name).is_absolute() and '..' not in Path(m.name).parts
                        and not m.issym() and not m.islnk() for m in members)

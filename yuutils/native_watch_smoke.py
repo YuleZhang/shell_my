@@ -214,6 +214,11 @@ def tui_smoke(binary):
                 time.sleep(3.2)
                 denied('no-candidate', 1)
             print('native lifecycle: successful/aborted/latest-success turns deny stale errors')
+            for phase in ('bare-rate', 'non429-402', 'non429-500', 'quoted-429'):
+                set_case(phase)
+                time.sleep(3.2)
+                denied('no-candidate', 1)
+            print('native HTTP status gate: bare code/non-429/quoted 429 denied; sends=1, dispatched=1')
             set_case('rate-unsettled')
             time.sleep(3.2)
             denied('not-settled', 1)
