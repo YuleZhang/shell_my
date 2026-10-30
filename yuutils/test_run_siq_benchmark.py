@@ -31,6 +31,37 @@ Sampling Period: 5 ms
 
 
 class MeasurementTest(unittest.TestCase):
+    def test_missing_adb_device_reports_actionable_reason(self):
+        reply = subprocess.CompletedProcess(['adb', 'devices', '-l'], 0,
+                                            'List of devices attached\n', '')
+        with mock.patch.object(b.subprocess, 'run', return_value=reply):
+            with self.assertRaisesRegex(b.BenchmarkError, 'no matching online device.*ADB_SERVER_SOCKET'):
+                b.collect_device('adb', {})
+
+    def test_preflight_usage_error_keeps_its_reason(self):
+        self.assertEqual(b.safe_error(SystemExit('input directory is empty'))['message'],
+                         'input directory is empty')
+
+    def test_dynamic_main_loop_patch_preserves_failure_branch(self):
+        main = ('int main() {\n'
+                '    for (int i = 0; i < optParam.loop_cnt; ++i) {\n'
+                '        ANC_Status status = test.GeneralTestOneImage(optParam);\n'
+                '        if (status != ANC_SS_OK) {\n'
+                '            printf("failed: %d\\n", status);\n'
+                '            return -1;\n'
+                '        }\n'
+                '    }\n'
+                '    return 0;\n}\n')
+        for mode, outer in ((1, 3), (2, 1)):
+            with self.subTest(mode=mode):
+                patched, _ = b.patch_main_source(main, mode, 3)
+                self.assertIn(f'siq_bench_loop < {outer}', patched)
+                self.assertEqual(patched.count('@@SIQ_BENCH_BEGIN@@'), 1)
+                self.assertEqual(patched.count('@@SIQ_BENCH_END@@'), 1)
+                self.assertIn('printf("failed: %d\\n", status);', patched)
+                self.assertIn('return -1;', patched)
+                self.assertNotIn('i < optParam.loop_cnt', patched)
+
     def test_duplicate_adb_serial_requires_transport_and_pins_commands(self):
         devices = ('List of devices attached\n'
                    'same device product:first model:first transport_id:1\n'
@@ -1514,6 +1545,61 @@ class GitFixtureTest(unittest.TestCase):
                 '--loops', '2', '--work-dir', str(self.base / 'single-artifacts')]
         return argv, logged
 
+    def test_unsupported_main_loop_reports_reason_before_run_log(self):
+        argv, _ = self.fake_single()
+        main = self.repo / 'src/projects/project/native_test/src/main.cpp'
+        main.write_text('int main() {\n if (true) {\n  test.GeneralTestOneImage(optParam);\n }\n}\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
+                mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = b.main(argv)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn('cannot patch main.cpp: unsupported enclosing loop/conditional',
+                      result['primary_error']['message'])
+        self.assertIn('unsupported enclosing loop/conditional', stderr.getvalue())
+
+    def test_build_failure_replays_full_log(self):
+        argv, _ = self.fake_single()
+        def failed_build(command, cwd, env, log, *args, **kwargs):
+            if log.name == 'run.log':
+                log.write_text('RAW_BUILD_ERROR\n')
+                Path(kwargs['stage_events']).write_text(json.dumps({
+                    'stage': 'build SDK', 'state': 'end', 'exit_code': 1}) + '\n')
+                b.print_failed_run_log(log)
+                return 1
+            log.write_text('')
+            return 0
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(b, 'run_logged', failed_build), \
+                mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
+                mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = b.main(argv)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn('build SDK failed (exit=1)', result['primary_error']['message'])
+        self.assertIn('RAW_BUILD_ERROR', stderr.getvalue())
+        self.assertEqual(stderr.getvalue().count('full run.log follows:'), 1)
+
+    def test_postrun_failure_replays_full_log_once(self):
+        argv, logged = self.fake_single()
+        def missing_deployment(command, cwd, env, log, *args, **kwargs):
+            code = logged(command, cwd, env, log, *args, **kwargs)
+            if log.name == 'run.log':
+                Path(env['_BENCH_DEPLOYMENT']).unlink()
+            return code
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(b, 'run_logged', missing_deployment), \
+                mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
+                mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = b.main(argv)
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr.getvalue().count('full run.log follows:'), 1)
+        self.assertIn('RAW_TRANSCRIPT_SENTINEL', stderr.getvalue())
+
     def test_original_positional_command_is_not_parsed_as_script_arguments_twice(self):
         named, logged = self.fake_single(host_exit=1)
         script = named[named.index('--run-script') + 1]
@@ -1598,13 +1684,22 @@ class GitFixtureTest(unittest.TestCase):
         self.assertTrue((directory / 'adb_pull_01.log').exists())
         self.assertTrue((directory / 'adb_pull_01_relocated.log').exists())
 
-    def test_local_process_timeout_and_no_transcript_replay(self):
+    def test_local_process_timeout_replays_log_after_exit(self):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = b.run_logged([os.sys.executable, '-c',
                 'import time; print("RAW_TRANSCRIPT_SENTINEL", flush=True); time.sleep(20)'],
                 self.base, self.env, self.base / 'timeout.log', timeout_seconds=1, cat_log_on_failure=True)
         self.assertEqual(code, 124)
+        self.assertIn('RAW_TRANSCRIPT_SENTINEL', stderr.getvalue())
+
+    def test_successful_run_does_not_replay_log(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = b.run_logged([os.sys.executable, '-c', 'print("RAW_TRANSCRIPT_SENTINEL")'],
+                                self.base, self.env, self.base / 'success.log', cat_log_on_failure=True)
+        self.assertEqual(code, 0)
+        self.assertIn('RAW_TRANSCRIPT_SENTINEL', (self.base / 'success.log').read_text())
         self.assertNotIn('RAW_TRANSCRIPT_SENTINEL', stdout.getvalue() + stderr.getvalue())
 
     def child_program(self, kill=False):

@@ -340,8 +340,9 @@ class StageProgress:
 
 
 def print_failed_run_log(log_path: Path) -> None:
-    """The transcript may contain credentials: never replay it to the terminal."""
-    print('[error] run failed; private run.log retained for local inspection', file=sys.stderr, flush=True)
+    print(f'[error] run failed; full run.log follows: {log_path}', file=sys.stderr, flush=True)
+    with log_path.open('r', encoding='utf-8', errors='replace') as log:
+        shutil.copyfileobj(log, sys.stderr)
 
 
 def build_input_manifest(input_dir: Path) -> dict[str, dict[str, int | str]]:
@@ -688,7 +689,7 @@ def run_logged(
         debug_log,
         f"[done] {log_path.name}: exit={return_code}, elapsed={int(time.monotonic() - started)}s",
     )
-    # Never replay a successful run log; only the explicit failure path may do so.
+    # Replay only after failure, once the child process has stopped.
     if cat_log_on_failure and return_code != 0:
         print_failed_run_log(log_path)
     return return_code
@@ -974,6 +975,27 @@ def patch_main_source(source_text: str, mode: int, loops: int, detected_outer_ru
     pattern = re.compile(r'(?m)^[ \t]*(?:ANC_Status\s+status(?:\s*=\s*ANC_SS_OK)?;\s*)?' + loop)
     matches = list(pattern.finditer(masked))
     if not matches:
+        dynamic = re.search(r'(?m)^[ \t]*for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*optParam\.loop_cnt\s*;[^)]*\)\s*\{', masked)
+        if dynamic and len(re.findall(r'\bGeneralTestOneImage\s*\(', masked)) == 1:
+            opening = dynamic.end() - 1
+            depth = 1
+            closing = opening + 1
+            while depth and closing < len(masked):
+                depth += (masked[closing] == '{') - (masked[closing] == '}')
+                closing += 1
+            call_match = re.search(r'ANC_Status\s+status\s*=\s*test\.GeneralTestOneImage\(optParam\);', masked[opening + 1:closing - 1])
+            if (depth == 0 and call_match and not masked[opening + 1:opening + 1 + call_match.start()].strip()
+                    and masked[:dynamic.start()].count('{') == masked[:dynamic.start()].count('}')):
+                call_end = opening + 1 + call_match.end()
+                outer = loops if mode == 1 else 1
+                replacement = (
+                    f'for (int siq_bench_loop = 0; siq_bench_loop < {outer}; ++siq_bench_loop) {{'
+                    f'\n        printf("@@SIQ_BENCH_BEGIN@@ mode={mode} pid=%d iteration=%d\\n", (int)getpid(), siq_bench_loop + 1);'
+                    + body[opening + 1:call_end]
+                    + f'\n        printf("@@SIQ_BENCH_END@@ mode={mode} pid=%d iteration=%d status=%d\\n", (int)getpid(), siq_bench_loop + 1, (int)status);'
+                    + body[call_end:closing]
+                )
+                return source_text[:start + dynamic.start()] + replacement + source_text[start + closing:], f"main.cpp lifecycle loop={outer}"
         matches = list(re.finditer(r'(?m)^[ \t]*' + statement, masked))
     if len(matches) != 1 or len(re.findall(r'\bGeneralTestOneImage\s*\(', masked)) != 1:
         raise RuntimeError("unsupported main.cpp lifecycle loop; refusing ambiguous patch")
@@ -1049,7 +1071,10 @@ def temporary_source_patch(repo_root: Path, main_source: Path | None, mode: int,
         if source.is_symlink():
             raise RuntimeError('refusing symlink source')
         originals[rel] = source.read_bytes()
-        text, description = transform(originals[rel].decode('utf-8'), mode, loops)
+        try:
+            text, description = transform(originals[rel].decode('utf-8'), mode, loops)
+        except RuntimeError as exc:
+            raise BenchmarkError(f"cannot patch {source.name}: {exc}") from exc
         patched[rel] = text.encode('utf-8')
         descriptions.append(description)
         patch_parts.append(source_patch(rel, originals[rel], patched[rel]))
@@ -1392,7 +1417,7 @@ def collect_device(adb: str, env: dict[str, str], transport_id: int | None = Non
     devices = subprocess.run([adb, 'devices', '-l'], env=env, capture_output=True,
                              text=True, timeout=15)
     if devices.returncode != 0:
-        raise RuntimeError('adb devices query failed')
+        raise BenchmarkError('adb devices failed; check ADB_SERVER_SOCKET and the adb server')
     rows = [line.split() for line in devices.stdout.splitlines()[1:] if line.strip()]
     selector = env.get('ANDROID_SERIAL') or env.get('ADB_SERIAL')
     def matches_selector(row):
@@ -1403,7 +1428,9 @@ def collect_device(adb: str, env: dict[str, str], transport_id: int | None = Non
         selected = [row for row in rows if len(row) >= 3 and row[1] == 'device' and
                     matches_selector(row)]
     if len(selected) != 1:
-        raise RuntimeError('select one adb connection using --transport-id (adb devices -l)')
+        if not selected:
+            raise BenchmarkError('adb: no matching online device; check ADB_SERVER_SOCKET, ANDROID_SERIAL, and adb devices -l')
+        raise BenchmarkError('adb: multiple matching devices; select one with --transport-id (adb devices -l)')
     row = selected[0]
     transport = next(field.split(':', 1)[1] for field in row[2:]
                      if field.startswith('transport_id:'))
@@ -1412,13 +1439,13 @@ def collect_device(adb: str, env: dict[str, str], transport_id: int | None = Non
         result = subprocess.run([adb, *target, *arguments], env=env, capture_output=True,
                                 text=True, timeout=15)
         if result.returncode != 0:
-            raise RuntimeError('device identity query failed')
+            raise BenchmarkError('adb: selected device did not respond during identity check')
         return result.stdout.strip()
     serial = query(['get-serialno'])
     if not serial or serial == 'unknown':
-        raise RuntimeError('selected adb connection has no serial')
+        raise BenchmarkError('adb: selected device has no serial')
     if serial != row[0] or not matches_selector(row):
-        raise RuntimeError('selected adb connection does not match requested serial')
+        raise BenchmarkError('adb: selected device does not match requested serial')
     return {'serial': serial, 'adb_server_socket': env.get('ADB_SERVER_SOCKET'),
             'transport_id': int(transport),
             'soc': query(['shell', 'getprop', 'ro.soc.model']),
@@ -1991,6 +2018,12 @@ def run_single(args, result) -> int:
     result['source']['replayed_lifecycle_copies_removed'] = replayed_copies
     if replayed_copies:
         append_debug(debug_log, f"collapsed {replayed_copies} byte-identical lifecycle log copies")
+    if run_exit in (124, -signal.SIGTERM, -signal.SIGKILL):
+        raise BenchmarkError(f"benchmark interrupted/timed out (exit {run_exit}); artifacts rejected")
+    failed_stage = next((event for event in reversed(events)
+                         if event.get('state') == 'end' and event.get('exit_code')), None)
+    if run_exit and failed_stage:
+        raise BenchmarkError(f"{failed_stage['stage']} failed (exit={failed_stage['exit_code']}); full run.log shown above: {run_log}")
     build_log_line = extract_build_log_line(log_text)
     if build_log_line:
         append_debug(debug_log, f"[build] {build_log_line}")
@@ -1999,14 +2032,10 @@ def run_single(args, result) -> int:
     performance = structured_performance(log_text, args.functions, args.loops)
     performance_samples = {name: metric['samples'] for name, metric in performance.items()}
     result['performance'] = performance
-    if run_exit in (124, -signal.SIGTERM, -signal.SIGKILL):
-        raise RuntimeError(f"benchmark interrupted/timed out (exit {run_exit}); artifacts rejected")
     try:
         validation = validate_run(log_text, args.mode, args.loops)
     except RuntimeError as exc:
-        if run_exit == 0:
-            print_failed_run_log(run_log)
-        raise RuntimeError(f"{exc}; run script exit={run_exit}; see {run_log}") from exc
+        raise BenchmarkError(f"{exc}; run script exit={run_exit}; see {run_log}") from exc
     deployment = json.loads((work_dir / "deployment.json").read_text())
     if (deployment.get('input_manifest') != manifest_before or
             deployment.get('remote_input_manifest') != manifest_before or
@@ -2264,6 +2293,8 @@ class MissingDeploymentArtifacts(BenchmarkError):
 def safe_error(exc):
     if isinstance(exc, BenchmarkError):
         return {'type': type(exc).__name__, 'message': str(exc)}
+    if isinstance(exc, SystemExit) and isinstance(exc.code, str):
+        return {'type': 'UsageError', 'message': exc.code}
     if isinstance(exc, KeyboardInterrupt):
         return {'type': 'Interrupted', 'message': 'interrupted; inspect recovery receipt'}
     if isinstance(exc, subprocess.TimeoutExpired):
@@ -3143,6 +3174,10 @@ def main(argv=None) -> int:
     finally:
         os.umask(old_umask)
     save_result(result)
+    if result['status'] == 'failed' and result.get('run_exit') == 0:
+        run_log_info = result.get('artifacts', {}).get('run_log', {})
+        if run_log_info.get('path') and Path(run_log_info['path']).is_file():
+            print_failed_run_log(Path(run_log_info['path']))
     if json_mode:
         print(json.dumps(public_result(result), ensure_ascii=False, allow_nan=False))
     if result.get('primary_error'):
