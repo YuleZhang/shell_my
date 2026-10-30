@@ -1672,6 +1672,27 @@ class GitFixtureTest(unittest.TestCase):
             value = result['artifacts'][artifact]
             self.assertEqual(value['sha256'], b.file_sha256(Path(value['path'])))
 
+    def test_plain_output_preserves_native_and_helper_text(self):
+        argv, logged = self.fake_single()
+        argv.remove('--json')
+        report = 'RAW PERFORMANCE REPORT\n| process_image | 2 calls |\n'
+        def with_report(command, cwd, env, log, *args, **kwargs):
+            if log.name == 'performance.log':
+                log.write_text(report)
+                return 0
+            return logged(command, cwd, env, log, *args, **kwargs)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(b, 'run_logged', with_report), \
+                mock.patch.object(b, 'collect_device', return_value={'serial': 'fixture', 'transport_id': 1}), \
+                mock.patch.object(b.shutil, 'which', return_value='/fixture/tool'), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            b.main(argv)
+        output = stdout.getvalue()
+        self.assertIn(NATIVE, output)
+        self.assertIn(report, output)
+        self.assertNotIn('dma sampled peak (MB):', output)
+        self.assertNotIn('RAW_TRANSCRIPT_SENTINEL', output)
+
     def test_relocated_csv_keeps_both_pull_attempt_logs(self):
         argv, logged = self.fake_single(pull_relocated=True)
         stdout = io.StringIO()

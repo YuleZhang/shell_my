@@ -2130,7 +2130,7 @@ def run_single(args, result) -> int:
         debug_log,
         "process performance log",
     )
-    performance_report = performance_log.read_text(encoding="utf-8", errors="ignore").strip()
+    performance_report = performance_log.read_text(encoding="utf-8", errors="ignore")
     performance_warning = None
     if process_exit != 0:
         performance_warning = 'performance helper failed; structured native samples retained'
@@ -2140,10 +2140,9 @@ def run_single(args, result) -> int:
     timing_statistics = {name: metric['statistics'] for name, metric in performance.items()
                          if metric['statistics'] is not None}
     if not args.json:
-        print_measurement_scope(validation, timing_statistics)
-        for component, metrics in result['memory'].items():
-            if component != 'cross_validation':
-                print(component + ' sampled peak (MB): ' + str(metrics['sampled_peak']['value']), flush=True)
+        sys.stdout.write(memory_summary + '\n')
+        sys.stdout.write(performance_report)
+        sys.stdout.flush()
 
     trace_path: Path | None = None
     merged_trace: Path | None = None

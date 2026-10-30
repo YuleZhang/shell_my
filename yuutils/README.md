@@ -68,6 +68,10 @@ benchmark 的工作目录会保留命令审计信息以及底层脚本的完整�
 凭据环境变量做脱敏，但底层脚本仍可能自行打印敏感内容；共享 `run.log`、`debug.log`
 或完整结果目录前应先检查并脱敏。
 
+默认终端输出保留原生 `Memory Usage Summary` 和 `process_sdk_log.py` 的文本格式；
+完整 `run.log` 保存在工作目录中，仅在运行失败时回显。显式传入 `--json` 时，stdout
+只输出一个 JSON 对象，进度和失败日志走 stderr。
+
 `run_siq_benchmark.py` 会自动定位同一 yuutils 安装中的
 `process_sdk_log.py`、Perfetto 合并脚本和 `adb-sync` 环境。也可以显式覆盖：
 
@@ -95,8 +99,7 @@ scripts_merge_mpool_csv_to_perfetto.py \
 
 ## SIQ 结构化结果与原目录 commit A/B
 
-`--json` 是布尔开关，stdout **恰好一个 JSON 对象**（失败也一样），进度和脱敏错误走
-stderr；不会回显原始 `run.log`。例如沿用原运行参数，再追加开关：
+`--json` 是布尔开关，stdout **恰好一个 JSON 对象**（失败也一样）。例如沿用原运行参数，再追加开关：
 
 ```bash
 run_siq_benchmark.py path/to/scripts/run_project.sh \
