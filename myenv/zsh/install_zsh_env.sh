@@ -94,8 +94,7 @@ antigen bundle marlonrichert/zsh-autocomplete@main
 antigen theme romkatv/powerlevel10k
 # Tell Antigen that you're done.
 antigen apply
-export PATH=/data1/share/android_sdk_ok/platform-tools/:/data2/huyonggang/opt/cmake-3.23.2-linux-x86_64/bin:$HOME/.local/bin:$HOME/bin:$HOME/.nvm/versions/node/v24.15.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
-export ANDROID_NDK_HOME=/data2/huyonggang/opt/android-ndk-r23
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 alias ta='tmux new-session -A -s main'
 # To customize prompt, run `p10k configure` or edit ~/.p10k.zsh.
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh

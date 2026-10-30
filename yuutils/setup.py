@@ -12,7 +12,7 @@ HERE = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, HERE)
 import yuutils_manifest  # noqa: E402
 
-VERSION = '1.5.3'
+VERSION = '1.5.4'
 SUPPORT_DIR = 'yuutils-support'
 
 
@@ -26,11 +26,24 @@ class YuutilsSdist(sdist):
 
   def make_release_tree(self, base_dir, files):
     super().make_release_tree(base_dir, files)
+    source_map = {}
     for relative in yuutils_manifest.MYENV_FILES:
       source = yuutils_manifest.ResolvePath(relative)
+      source_map[os.path.abspath(source)] = relative
       destination = os.path.join(base_dir, relative)
       os.makedirs(os.path.dirname(destination), exist_ok=True)
       shutil.copy2(source, destination)
+    for root, _, names in os.walk(base_dir):
+      if os.path.basename(root).endswith('.egg-info') and 'SOURCES.txt' in names:
+        manifest = os.path.join(root, 'SOURCES.txt')
+        with open(manifest, encoding='utf-8') as stream:
+          lines = stream.read().splitlines()
+        lines = [source_map.get(line, line) for line in lines]
+        absolute = [line for line in lines if os.path.isabs(line)]
+        if absolute:
+          raise ValueError('source manifest contains unresolved absolute paths')
+        with open(manifest, 'w', encoding='utf-8') as stream:
+          stream.write('\n'.join(lines) + '\n')
 
 
 setup(

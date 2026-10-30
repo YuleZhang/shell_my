@@ -1,4 +1,4 @@
-// yuutils native bridge v1.5.3. No transcripts, prompts or credentials on disk.
+// yuutils native bridge v1.5.4. No transcripts, prompts or credentials on disk.
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
@@ -6,6 +6,17 @@ import crypto from 'node:crypto';
 
 const hex = (n) => crypto.randomBytes(n).toString('hex');
 const now = () => performance.now();
+
+function explicitRateLimit(text) {
+  const error = text.match(/^\s*(?:Error:\s*)?(?:Retry\s+failed\s+after\s+\d+\s+attempts?:\s*)?OpenAI\s+API\s+error\s*\((\d{3})\):\s*(\{[\s\S]*\})\s*$/i);
+  if (!error || error[1] !== '429') return false;
+  try {
+    // Error messages may contain literal line breaks inside the JSON message.
+    const body = JSON.parse(error[2].replace(/[\r\n]/g, ' '));
+    return body.code === 'rate_limit_exceeded' || body.type === 'rate_limit_exceeded' ||
+      (typeof body.message === 'string' && /^Rate\s+limit\s+exceeded\b/i.test(body.message));
+  } catch { return false; }
+}
 
 export class RecoveryGate {
   constructor(clock = now) {
@@ -38,8 +49,7 @@ export class RecoveryGate {
       this.candidate = 'quota-exhausted';
     } else if (/Our\s+servers\s+are\s+currently\s+overloaded\.\s*Please\s+try\s+again\s+later\./i.test(last.errorMessage)) {
       this.candidate = 'overload';
-    } else if (/\brate_limit_exceeded\b/.test(last.errorMessage) ||
-               /OpenAI\s+API\s+error\s*\(429\):[\s\S]*Rate\s+limit\s+exceeded\b/i.test(last.errorMessage)) {
+    } else if (explicitRateLimit(last.errorMessage)) {
       this.candidate = 'rate-limit';
     }
   }

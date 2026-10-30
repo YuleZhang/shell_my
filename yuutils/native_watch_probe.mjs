@@ -182,9 +182,15 @@ export default function probe(pi) {
       ctx.ui.setEditorText('');
     }
     handlers.get('agent_start')({}, ctx);
-    const errorMessage = arg.startsWith('rate') ? rateError :
+    const deniedRates = {
+      'bare-rate': 'rate_limit_exceeded',
+      'non429-402': 'Error: OpenAI API error (402): {"code":"rate_limit_exceeded"}',
+      'non429-500': 'Error: OpenAI API error (500): {"message":"Rate limit exceeded"}',
+      'quoted-429': 'Error: OpenAI API error (402): {"message":"Previous OpenAI API error (429): Rate limit exceeded"}',
+    };
+    const errorMessage = deniedRates[arg] ?? (arg.startsWith('rate') ? rateError :
       arg === 'quota-mixed' ? quotaError + '\nrate_limit_exceeded\n' + overloadError :
-      arg === 'quota' ? quotaError : overloadError;
+      arg === 'quota' ? quotaError : overloadError);
     const failed = { role: 'assistant', stopReason: 'error', errorMessage };
     const messages = arg === 'success' ? [{ ...failed, stopReason: 'stop' }] :
       arg === 'aborted' ? [{ ...failed, stopReason: 'aborted' }] :
