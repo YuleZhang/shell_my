@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -1060,6 +1061,46 @@ class GitFixtureTest(unittest.TestCase):
         self.assertEqual((b.git_head(extra), b.git_branch(extra), b.tracked_fingerprint(extra)), identity)
         tx.restore()
         b.verify_original(self.repo, original)
+
+    def test_fingerprint_ignores_abbreviated_object_id_width(self):
+        # git abbreviates the ids on a diff "index" line by a width derived from the
+        # object database, not from content. A racily-clean rewrite of an unchanged
+        # tracked file (a run script regenerating scripts/trace_sxp.pbtx) made git
+        # widen 7 hex to 9 on the first diff afterwards, so identical bytes hashed
+        # differently and verify_original reported a bogus restore failure.
+        (self.repo / 'generated').write_text('before\n')
+        self.commit(self.repo, 'track generated config')
+        (self.repo / 'source').write_text('dirty\n')
+        baseline = b.tracked_fingerprint(self.repo)
+        real = b.git_bytes
+        # The fixture repo is too small for git to widen on its own, so widen for it:
+        # emit every abbreviated pair with extra hex digits appended.
+        index_line = re.compile(rb'^(index [0-9a-f]{7,}\.\.[0-9a-f]{7,})( 100644)$', re.MULTILINE)
+
+        def widening(repo, *arguments, **kwargs):
+            value = real(repo, *arguments, **kwargs)
+            if '--full-index' in arguments:
+                return value
+            return index_line.sub(rb'\1aaaaaaa\2', value)
+
+        # Sanity: the unstaged diff really is non-empty and really gets widened, so a
+        # naive content hash of it would change.
+        raw = real(self.repo, 'diff', '--binary', '--no-ext-diff', '--no-textconv',
+                   '--ignore-submodules=all')
+        self.assertIn(b'index ', raw)
+        self.assertNotEqual(raw, index_line.sub(rb'\1aaaaaaa\2', raw))
+
+        with mock.patch.object(b, 'git_bytes', widening):
+            widened = b.tracked_fingerprint(self.repo)
+        self.assertEqual(widened, baseline)
+
+    def test_fingerprint_detects_real_worktree_edit(self):
+        # --full-index must not make the fingerprint blind to actual content changes.
+        (self.repo / 'generated').write_text('before\n')
+        self.commit(self.repo, 'track generated config')
+        baseline = b.tracked_fingerprint(self.repo)
+        (self.repo / 'generated').write_text('after\n')
+        self.assertNotEqual(b.tracked_fingerprint(self.repo), baseline)
 
     def test_nonrecursive_update_detects_clean_nested_identity_change(self):
         self.nested_fixture()

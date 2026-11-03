@@ -2369,11 +2369,16 @@ def git_branch(repo):
 
 
 def tracked_fingerprint(repo):
+    # --full-index emits unabbreviated object ids, so the hash stays a pure function
+    # of content. Git abbreviates them by default and the width is not stable across
+    # invocations: rewriting an unchanged tracked file (a run script regenerating
+    # scripts/trace_sxp.pbtx does exactly that) makes git re-hash loose objects and
+    # print 9 hex instead of 7, changing this hash while the worktree is byte-identical.
     return {name: hashlib.sha256(git_bytes(repo, *arguments)).hexdigest()
             for name, arguments in (
                 ('index', ('ls-files', '--stage', '-z')),
-                ('staged', ('diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')),
-                ('unstaged', ('diff', '--binary', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')))}
+                ('staged', ('diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')),
+                ('unstaged', ('diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')))}
 
 
 def tracked_dirty(repo):
