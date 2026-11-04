@@ -43,6 +43,62 @@ class MeasurementTest(unittest.TestCase):
         self.assertEqual(b.safe_error(SystemExit('input directory is empty'))['message'],
                          'input directory is empty')
 
+    def test_expected_validation_error_keeps_its_reason(self):
+        with self.assertRaises(b.BenchmarkError) as raised:
+            b.structured_performance(
+                '@@SIQ_BENCH_BEGIN@@ mode=1 pid=7 iteration=1\nAborted\n',
+                'process_image',
+                10,
+            )
+        self.assertEqual(
+            b.safe_error(raised.exception)['message'],
+            'process_image timing coverage is incomplete',
+        )
+
+    def test_failure_diagnostics_include_abort_and_traceback_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'run.log'
+            log.write_text(
+                "export HPC_DEBUG_ENV_UNLOCK_KEY='private-key'\n"
+                '                    --=> enter InitDRCCurveHPC\n'
+                'Aborted\n'
+                'ordinary verbose output that must stay private\n'
+                'Traceback (most recent call last):\n'
+                '  File "/private/decode_rgb.py", line 1, in <module>\n'
+                'ValueError: cannot reshape array\n'
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                b.print_failed_run_log(log)
+        report = stderr.getvalue()
+        self.assertIn('last native operation: --=> enter InitDRCCurveHPC', report)
+        self.assertIn('Aborted', report)
+        self.assertIn('Traceback (most recent call last):', report)
+        self.assertIn('ValueError: cannot reshape array', report)
+        self.assertIn('full run log retained at:', report)
+        self.assertNotIn('private-key', report)
+        self.assertNotIn('ordinary verbose output', report)
+
+    def test_unexpected_exception_is_retained_in_private_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / 'artifacts'
+            work.mkdir()
+            args = mock.Mock(repo_root=Path(directory))
+
+            def fail(_args, result):
+                result['_work_dir'] = str(work)
+                result['phase'] = 'validate_native'
+                raise ValueError('PRIVATE_EXCEPTION_DETAIL')
+
+            with mock.patch.object(b, 'run_single', fail):
+                result = b.execute_single(args)
+            report = Path(result['artifacts']['exception_report']['path'])
+            self.assertTrue(report.is_file())
+            self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+            self.assertIn('PRIVATE_EXCEPTION_DETAIL', report.read_text())
+            self.assertNotIn('PRIVATE_EXCEPTION_DETAIL', result['primary_error']['message'])
+            self.assertIn('private exception report retained', result['primary_error']['message'])
+
     def test_dynamic_main_loop_patch_preserves_failure_branch(self):
         main = ('int main() {\n'
                 '    for (int i = 0; i < optParam.loop_cnt; ++i) {\n'
@@ -1601,11 +1657,15 @@ class GitFixtureTest(unittest.TestCase):
                       result['primary_error']['message'])
         self.assertIn('unsupported enclosing loop/conditional', stderr.getvalue())
 
-    def test_build_failure_replays_full_log(self):
+    def test_build_failure_reports_bounded_diagnostics(self):
         argv, _ = self.fake_single()
         def failed_build(command, cwd, env, log, *args, **kwargs):
             if log.name == 'run.log':
-                log.write_text('RAW_BUILD_ERROR\n')
+                log.write_text(
+                    "export PRIVATE_TOKEN='do-not-print'\n"
+                    "FATAL: synthetic build failed\n"
+                    "UNRELATED_RAW_TRANSCRIPT\n"
+                )
                 Path(kwargs['stage_events']).write_text(json.dumps({
                     'stage': 'build SDK', 'state': 'end', 'exit_code': 1}) + '\n')
                 b.print_failed_run_log(log)
@@ -1621,10 +1681,12 @@ class GitFixtureTest(unittest.TestCase):
         result = json.loads(stdout.getvalue())
         self.assertEqual(code, 1)
         self.assertIn('build SDK failed (exit=1)', result['primary_error']['message'])
-        self.assertIn('RAW_BUILD_ERROR', stderr.getvalue())
-        self.assertEqual(stderr.getvalue().count('full run.log follows:'), 1)
+        self.assertIn('FATAL: synthetic build failed', stderr.getvalue())
+        self.assertNotIn('do-not-print', stderr.getvalue())
+        self.assertNotIn('UNRELATED_RAW_TRANSCRIPT', stderr.getvalue())
+        self.assertEqual(stderr.getvalue().count('concise diagnostics from'), 1)
 
-    def test_postrun_failure_replays_full_log_once(self):
+    def test_postrun_failure_reports_artifact_path_without_raw_replay(self):
         argv, logged = self.fake_single()
         def missing_deployment(command, cwd, env, log, *args, **kwargs):
             code = logged(command, cwd, env, log, *args, **kwargs)
@@ -1638,8 +1700,8 @@ class GitFixtureTest(unittest.TestCase):
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = b.main(argv)
         self.assertEqual(code, 1)
-        self.assertEqual(stderr.getvalue().count('full run.log follows:'), 1)
-        self.assertIn('RAW_TRANSCRIPT_SENTINEL', stderr.getvalue())
+        self.assertEqual(stderr.getvalue().count('full run log retained at:'), 1)
+        self.assertNotIn('RAW_TRANSCRIPT_SENTINEL', stderr.getvalue())
 
     def test_original_positional_command_is_not_parsed_as_script_arguments_twice(self):
         named, logged = self.fake_single(host_exit=1)
@@ -1746,14 +1808,15 @@ class GitFixtureTest(unittest.TestCase):
         self.assertTrue((directory / 'adb_pull_01.log').exists())
         self.assertTrue((directory / 'adb_pull_01_relocated.log').exists())
 
-    def test_local_process_timeout_replays_log_after_exit(self):
+    def test_local_process_timeout_reports_log_path_after_exit(self):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = b.run_logged([os.sys.executable, '-c',
                 'import time; print("RAW_TRANSCRIPT_SENTINEL", flush=True); time.sleep(20)'],
                 self.base, self.env, self.base / 'timeout.log', timeout_seconds=1, cat_log_on_failure=True)
         self.assertEqual(code, 124)
-        self.assertIn('RAW_TRANSCRIPT_SENTINEL', stderr.getvalue())
+        self.assertIn('full run log retained at:', stderr.getvalue())
+        self.assertNotIn('RAW_TRANSCRIPT_SENTINEL', stderr.getvalue())
 
     def test_successful_run_does_not_replay_log(self):
         stdout, stderr = io.StringIO(), io.StringIO()
