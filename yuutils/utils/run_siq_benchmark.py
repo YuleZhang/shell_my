@@ -340,58 +340,114 @@ class StageProgress:
             self.active = None
 
 
-FAILURE_DIAGNOSTIC_RE = re.compile(
-    r"(?:^|\b)(?:Aborted|Segmentation fault|Bus error|Illegal instruction|Killed|"
-    r"FATAL(?:\b|:)|Traceback \(most recent call last\)|"
-    r"(?:Assertion|Check)[^\n]*failed|"
-    r"(?:ValueError|RuntimeError|OSError|KeyError|TypeError):)"
+NATIVE_CRASH_RE = re.compile(
+    r"(?:^|\n)(?:Aborted|Segmentation fault|Bus error|Illegal instruction|Killed)\s*(?:\n|$)|"
+    r"native test error!|GeneralTestOneImage failed|PROCESS_IMAGES_FAILED"
 )
 
 
-def sanitize_diagnostic_line(line: str) -> str:
-    """Return one bounded, secret-redacted line suitable for stderr."""
-    clean = ANSI_ESCAPE_RE.sub("", line.rstrip("\r\n"))
-    clean = SENSITIVE_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group('name')}='***'", clean
+def redact_runtime_log_line(line: str) -> str:
+    """Redact secret-bearing assignments while preserving the original log line."""
+    return SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('name')}='***'", line
     )
-    return clean[:1000]
 
 
-def extract_failure_diagnostics(log_path: Path, limit: int = 24) -> list[str]:
-    """Extract high-signal failure lines without replaying a potentially huge log."""
-    diagnostics: list[str] = []
-    last_native_operation: str | None = None
-    traceback_lines_left = 0
-    with log_path.open('r', encoding='utf-8', errors='replace') as log:
-        for raw_line in log:
-            line = sanitize_diagnostic_line(raw_line)
-            if '--=> enter ' in line:
-                last_native_operation = line[line.index('--=> enter '):].strip()
-            if traceback_lines_left:
-                if line.strip():
-                    diagnostics.append(line)
-                traceback_lines_left -= 1
-                continue
-            if 'Traceback (most recent call last)' in line:
-                diagnostics.append(line)
-                traceback_lines_left = 12
-            elif FAILURE_DIAGNOSTIC_RE.search(line):
-                if line.strip() == 'Aborted' and last_native_operation:
-                    diagnostics.append('last native operation: ' + last_native_operation)
-                diagnostics.append(line)
-    return unique(diagnostics)[-limit:]
+def replay_log_file(path: Path, heading: str, ending: str) -> None:
+    """Stream a complete failed-run artifact to stderr with secret redaction."""
+    print(f'{heading}: {path}', file=sys.stderr, flush=True)
+    ended_with_newline = True
+    with path.open('r', encoding='utf-8', errors='replace') as log:
+        for line in log:
+            ended_with_newline = line.endswith('\n')
+            sys.stderr.write(redact_runtime_log_line(line))
+    if not ended_with_newline:
+        sys.stderr.write('\n')
+    print(f'{ending}: {path}', file=sys.stderr, flush=True)
 
 
 def print_failed_run_log(log_path: Path) -> None:
-    """Print bounded diagnostics and the artifact path, never the complete run log."""
-    print(f'[error] run failed; concise diagnostics from {log_path}:', file=sys.stderr, flush=True)
-    diagnostics = extract_failure_diagnostics(log_path)
-    if diagnostics:
-        for line in diagnostics:
-            print('  ' + line, file=sys.stderr)
-    else:
-        print('  no high-signal failure line found', file=sys.stderr)
-    print(f'[error] full run log retained at: {log_path}', file=sys.stderr, flush=True)
+    """Replay the complete SDK log only after failure; successful logs stay on disk."""
+    replay_log_file(
+        log_path,
+        '[error] run failed; full SDK run.log follows (secrets redacted)',
+        '[error] end full SDK run.log',
+    )
+
+
+def native_crash_in_log(log_text: str) -> bool:
+    return bool(NATIVE_CRASH_RE.search(ANSI_ESCAPE_RE.sub('', log_text)))
+
+
+def crash_binary(repo_root: Path, adapter: str) -> tuple[str, Path | None]:
+    target = f'libanc_hdr_adapter_{adapter}.so'
+    candidates = [
+        repo_root / 'siq3_install/symbol' / target,
+        repo_root / 'siq3_install/release/C_SDK/libs/arm64-v8a' / target,
+        repo_root / 'scripts/libs/arm64-v8a' / target,
+    ]
+    return target, next((path for path in candidates if path.is_file()), None)
+
+
+def collect_and_report_native_stack(
+    real_adb: str,
+    transport_id: str,
+    repo_root: Path,
+    work_dir: Path,
+    parser: Path,
+    adapter: str,
+    env: dict[str, str],
+    timeout: int,
+    debug_log: Path | None,
+) -> dict:
+    """Collect logcat, symbolize it with parse_infer_stack.py, and print the result."""
+    artifacts = {}
+    logcat = work_dir / 'logcat.txt'
+    logcat_exit = run_logged(
+        [real_adb, '-t', transport_id, 'logcat', '-d'],
+        repo_root,
+        env,
+        logcat,
+        timeout,
+        debug_log,
+        'collect crash logcat',
+    )
+    artifacts['logcat'] = artifact_info(logcat)
+    if logcat_exit != 0:
+        print(f'[error] adb logcat collection failed (exit={logcat_exit}); see {logcat}',
+              file=sys.stderr, flush=True)
+        return artifacts
+    if not parser.is_file():
+        print(f'[error] parse_infer_stack.py not found: {parser}', file=sys.stderr, flush=True)
+        return artifacts
+
+    target, binary = crash_binary(repo_root, adapter)
+    parsed_stack = work_dir / 'parsed_stack.log'
+    command = [sys.executable, str(parser), '--log', str(logcat), '--target', target]
+    if binary is not None:
+        command.extend(['--binary', str(binary)])
+    symbolizer = shutil.which('llvm-symbolizer', path=env.get('PATH'))
+    if symbolizer:
+        command.extend(['--symbolizer', symbolizer])
+    parse_exit = run_logged(
+        command,
+        repo_root,
+        env,
+        parsed_stack,
+        timeout,
+        debug_log,
+        'parse crash stack',
+    )
+    artifacts['parsed_stack'] = artifact_info(parsed_stack)
+    replay_log_file(
+        parsed_stack,
+        '[error] parse_infer_stack.py output follows',
+        '[error] end parse_infer_stack.py output',
+    )
+    print(f'[error] full crash logcat retained at: {logcat}', file=sys.stderr, flush=True)
+    if parse_exit != 0:
+        print(f'[error] parse_infer_stack.py failed (exit={parse_exit})', file=sys.stderr, flush=True)
+    return artifacts
 
 
 def build_input_manifest(input_dir: Path) -> dict[str, dict[str, int | str]]:
@@ -1862,6 +1918,7 @@ def run_single(args, result) -> int:
         if args.merge_script is not None
         else find_companion_tool("scripts_merge_mpool_csv_to_perfetto.py")
     )
+    stack_parser = find_companion_tool("parse_infer_stack.py")
     if not process_sdk_log.is_file():
         raise SystemExit(f"process_sdk_log.py not found: {process_sdk_log}")
     if not merge_script.is_file():
@@ -2019,7 +2076,10 @@ def run_single(args, result) -> int:
         run_command = ["bash", str(run_script), *run_args]
     result['experiment']['build_before'] = build_artifact_snapshot(repo_root)
     result['experiment']['companion_tools_sha256'] = {
-        'performance': file_sha256(process_sdk_log), 'merge': file_sha256(merge_script)}
+        'performance': file_sha256(process_sdk_log),
+        'merge': file_sha256(merge_script),
+        'stack_parser': file_sha256(stack_parser),
+    }
     result['phase'] = 'build_deploy_run'
     result['artifacts']['run_log'] = artifact_info(run_log)
     with temporary_source_patch(repo_root, main_source, args.mode, args.loops, work_dir) as patch_receipt:
@@ -2052,7 +2112,7 @@ def run_single(args, result) -> int:
             args.timeout,
             debug_log,
             stage_events=stage_events,
-            cat_log_on_failure=True,
+            cat_log_on_failure=False,
         )
     result['run_exit'] = run_exit
     events = [json.loads(line) for line in stage_events.read_text().splitlines()] if stage_events.exists() else []
@@ -2067,6 +2127,43 @@ def run_single(args, result) -> int:
     result['source']['replayed_lifecycle_copies_removed'] = replayed_copies
     if replayed_copies:
         append_debug(debug_log, f"collapsed {replayed_copies} byte-identical lifecycle log copies")
+
+    failure_log_replayed = False
+    native_stack_reported = False
+
+    def replay_failure_log() -> None:
+        nonlocal failure_log_replayed
+        if not failure_log_replayed:
+            print_failed_run_log(run_log)
+            failure_log_replayed = True
+            result['_failure_log_replayed'] = True
+
+    def report_native_stack() -> None:
+        nonlocal native_stack_reported
+        if native_stack_reported:
+            return
+        native_stack_reported = True
+        try:
+            result['artifacts'].update(collect_and_report_native_stack(
+                real_adb,
+                env['_BENCH_TRANSPORT_ID'],
+                repo_root,
+                work_dir,
+                stack_parser,
+                args.adapter,
+                env,
+                args.timeout,
+                debug_log,
+            ))
+        except (OSError, BenchmarkError) as exc:
+            print(f'[error] native stack collection failed: {safe_error(exc)["message"]}',
+                  file=sys.stderr, flush=True)
+
+    if run_exit != 0:
+        replay_failure_log()
+    if native_crash_in_log(log_text):
+        replay_failure_log()
+        report_native_stack()
     if run_exit in (124, -signal.SIGTERM, -signal.SIGKILL):
         raise BenchmarkError(f"benchmark interrupted/timed out (exit {run_exit}); artifacts rejected")
     failed_stage = next((event for event in reversed(events)
@@ -2074,7 +2171,7 @@ def run_single(args, result) -> int:
     if run_exit and failed_stage:
         raise BenchmarkError(
             f"{failed_stage['stage']} failed (exit={failed_stage['exit_code']}); "
-            f"concise diagnostics shown above; full run log retained at {run_log}"
+            f"full SDK run.log shown above and retained at {run_log}"
         )
     build_log_line = extract_build_log_line(log_text)
     if build_log_line:
@@ -2084,6 +2181,8 @@ def run_single(args, result) -> int:
     try:
         validation = validate_run(log_text, args.mode, args.loops)
     except BenchmarkError as exc:
+        replay_failure_log()
+        report_native_stack()
         raise BenchmarkError(f"{exc}; run script exit={run_exit}; see {run_log}") from exc
     performance = structured_performance(log_text, args.functions, args.loops)
     performance_samples = {name: metric['samples'] for name, metric in performance.items()}
@@ -3254,10 +3353,11 @@ def main(argv=None) -> int:
     finally:
         os.umask(old_umask)
     save_result(result)
-    if result['status'] == 'failed' and result.get('run_exit') == 0:
+    if result['status'] == 'failed' and not result.get('_failure_log_replayed'):
         run_log_info = result.get('artifacts', {}).get('run_log', {})
         if run_log_info.get('path') and Path(run_log_info['path']).is_file():
             print_failed_run_log(Path(run_log_info['path']))
+            result['_failure_log_replayed'] = True
     if json_mode:
         print(json.dumps(public_result(result), ensure_ascii=False, allow_nan=False))
     if result.get('primary_error'):
