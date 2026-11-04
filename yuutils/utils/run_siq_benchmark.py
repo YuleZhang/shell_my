@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path, PurePosixPath
 
 
@@ -339,10 +340,58 @@ class StageProgress:
             self.active = None
 
 
-def print_failed_run_log(log_path: Path) -> None:
-    print(f'[error] run failed; full run.log follows: {log_path}', file=sys.stderr, flush=True)
+FAILURE_DIAGNOSTIC_RE = re.compile(
+    r"(?:^|\b)(?:Aborted|Segmentation fault|Bus error|Illegal instruction|Killed|"
+    r"FATAL(?:\b|:)|Traceback \(most recent call last\)|"
+    r"(?:Assertion|Check)[^\n]*failed|"
+    r"(?:ValueError|RuntimeError|OSError|KeyError|TypeError):)"
+)
+
+
+def sanitize_diagnostic_line(line: str) -> str:
+    """Return one bounded, secret-redacted line suitable for stderr."""
+    clean = ANSI_ESCAPE_RE.sub("", line.rstrip("\r\n"))
+    clean = SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('name')}='***'", clean
+    )
+    return clean[:1000]
+
+
+def extract_failure_diagnostics(log_path: Path, limit: int = 24) -> list[str]:
+    """Extract high-signal failure lines without replaying a potentially huge log."""
+    diagnostics: list[str] = []
+    last_native_operation: str | None = None
+    traceback_lines_left = 0
     with log_path.open('r', encoding='utf-8', errors='replace') as log:
-        shutil.copyfileobj(log, sys.stderr)
+        for raw_line in log:
+            line = sanitize_diagnostic_line(raw_line)
+            if '--=> enter ' in line:
+                last_native_operation = line[line.index('--=> enter '):].strip()
+            if traceback_lines_left:
+                if line.strip():
+                    diagnostics.append(line)
+                traceback_lines_left -= 1
+                continue
+            if 'Traceback (most recent call last)' in line:
+                diagnostics.append(line)
+                traceback_lines_left = 12
+            elif FAILURE_DIAGNOSTIC_RE.search(line):
+                if line.strip() == 'Aborted' and last_native_operation:
+                    diagnostics.append('last native operation: ' + last_native_operation)
+                diagnostics.append(line)
+    return unique(diagnostics)[-limit:]
+
+
+def print_failed_run_log(log_path: Path) -> None:
+    """Print bounded diagnostics and the artifact path, never the complete run log."""
+    print(f'[error] run failed; concise diagnostics from {log_path}:', file=sys.stderr, flush=True)
+    diagnostics = extract_failure_diagnostics(log_path)
+    if diagnostics:
+        for line in diagnostics:
+            print('  ' + line, file=sys.stderr)
+    else:
+        print('  no high-signal failure line found', file=sys.stderr)
+    print(f'[error] full run log retained at: {log_path}', file=sys.stderr, flush=True)
 
 
 def build_input_manifest(input_dir: Path) -> dict[str, dict[str, int | str]]:
@@ -364,7 +413,7 @@ def build_input_manifest(input_dir: Path) -> dict[str, dict[str, int | str]]:
             "sha256": file_sha256(path),
         }
     if not manifest:
-        raise RuntimeError(f"input directory has no regular files: {input_dir}")
+        raise BenchmarkError(f"input directory has no regular files: {input_dir}")
     return manifest
 
 
@@ -392,28 +441,28 @@ def remote_input_manifest(
     for line in responses[0].splitlines():
         parts = line.strip().split(maxsplit=1)
         if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
-            raise RuntimeError(f"malformed remote sha256sum output: {line!r}")
+            raise BenchmarkError(f"malformed remote sha256sum output: {line!r}")
         path = parts[1].lstrip("*").strip()
         if not path.startswith(prefix):
-            raise RuntimeError(f"remote input file is outside input directory: {path!r}")
+            raise BenchmarkError(f"remote input file is outside input directory: {path!r}")
         hashes[path[len(prefix):]] = parts[0].lower()
 
     sizes: dict[str, int] = {}
     for line in responses[1].splitlines():
         parts = line.strip().split(maxsplit=1)
         if len(parts) != 2:
-            raise RuntimeError(f"malformed remote wc output: {line!r}")
+            raise BenchmarkError(f"malformed remote wc output: {line!r}")
         try:
             size = int(parts[0])
         except ValueError as exc:
-            raise RuntimeError(f"malformed remote file size: {line!r}") from exc
+            raise BenchmarkError(f"malformed remote file size: {line!r}") from exc
         path = parts[1].strip()
         if not path.startswith(prefix):
-            raise RuntimeError(f"remote input file is outside input directory: {path!r}")
+            raise BenchmarkError(f"remote input file is outside input directory: {path!r}")
         sizes[path[len(prefix):]] = size
 
     if set(hashes) != set(sizes):
-        raise RuntimeError("remote input hash and size listings disagree")
+        raise BenchmarkError("remote input hash and size listings disagree")
     return {
         relative: {"size": sizes[relative], "sha256": hashes[relative]}
         for relative in sorted(hashes)
@@ -516,10 +565,10 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
     repo = Path(os.environ['_BENCH_REPO_ROOT'])
     manifest = Path(os.environ['_BENCH_DEPLOYMENT'])
     if manifest.exists():
-        raise RuntimeError("run script tried to launch siq_test more than once")
+        raise BenchmarkError("run script tried to launch siq_test more than once")
     cd = re.search(r"(?:^|;)\s*cd\s+([^;]+)", command)
     if not cd:
-        raise RuntimeError("cannot verify deployment: siq_test command has no working directory")
+        raise BenchmarkError("cannot verify deployment: siq_test command has no working directory")
     remote_dir = shlex.split(cd.group(1))[0]
     files = deployment_artifacts(repo)
     result = subprocess.run(
@@ -541,7 +590,7 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
         remote_manifest = remote_input_manifest(adb, adb_options, remote_input)
         difference = describe_manifest_diff(local_manifest, remote_manifest)
         if difference:
-            raise RuntimeError("input mirror verification failed: " + difference)
+            raise BenchmarkError("input mirror verification failed: " + difference)
         local_raw = sum(
             1 for relative in local_manifest
             if fnmatch.fnmatch(Path(relative).name, "*nput*.raw")
@@ -551,7 +600,7 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
             if fnmatch.fnmatch(Path(relative).name, "*nput*.raw")
         )
         if frames <= 0 or local_raw != frames or remote_raw != frames:
-            raise RuntimeError(
+            raise BenchmarkError(
                 f"deployed input count local={local_raw}, remote={remote_raw}, "
                 f"requested={frames}"
             )
@@ -571,7 +620,7 @@ def verify_deployment(adb: str, adb_options: list[str], command: str) -> None:
         )
         count = int(result.stdout.strip())
         if frames <= 0 or count != frames:
-            raise RuntimeError(f"deployed input count {count} differs from requested frames {frames}")
+            raise BenchmarkError(f"deployed input count {count} differs from requested frames {frames}")
         deployment = {'sha256': hashes, 'input_frames': count, 'invocations': 1}
     deployment['local_build_artifacts'] = build_artifact_snapshot(repo)
     manifest.write_text(json.dumps(deployment, indent=2) + '\n')
@@ -700,14 +749,14 @@ def find_csv_paths(log_text: str) -> list[str]:
         "\n".join(line for line in log_text.splitlines() if "close csv file" in line)
     )
     if not closed_paths:
-        raise RuntimeError("run log does not contain a completed mem_use_info CSV path")
+        raise BenchmarkError("run log does not contain a completed mem_use_info CSV path")
     candidates = unique(closed_paths)
     pid_paths = [path for path in candidates if not path.endswith("_all_in_one.csv")]
     if pid_paths:
         return pid_paths
     if candidates:
         return candidates
-    raise RuntimeError("run log does not contain a usable completed mem_use_info CSV path")
+    raise BenchmarkError("run log does not contain a usable completed mem_use_info CSV path")
 
 
 def find_csv_path(log_text: str) -> str:
@@ -730,7 +779,7 @@ def extract_memory_summary(log_text: str) -> str:
     lines = log_text.splitlines(keepends=True)
     starts = [index for index, line in enumerate(lines) if "Memory Usage Summary" in line]
     if not starts:
-        raise RuntimeError("run log does not contain Memory Usage Summary")
+        raise BenchmarkError("run log does not contain Memory Usage Summary")
     start = starts[-1]
     block: list[str] = []
     for index in range(start, len(lines)):
@@ -740,7 +789,7 @@ def extract_memory_summary(log_text: str) -> str:
                 block.append(lines[index + 1])
             break
     if not any("Sampling Period:" in line for line in block):
-        raise RuntimeError("Memory Usage Summary is incomplete")
+        raise BenchmarkError("Memory Usage Summary is incomplete")
     return "".join(block).rstrip("\n")
 
 
@@ -948,14 +997,14 @@ def function_span(text: str, signature: str) -> tuple[int, int]:
     masked = cpp_code_mask(text)
     start = masked.find(signature)
     if start < 0:
-        raise RuntimeError(f"cannot find {signature}")
+        raise BenchmarkError(f"cannot find {signature}")
     opening = masked.index('{', start)
     depth = 1
     for pos in range(opening + 1, len(masked)):
         depth += (masked[pos] == '{') - (masked[pos] == '}')
         if depth == 0:
             return opening + 1, pos
-    raise RuntimeError(f"unbalanced function {signature}")
+    raise BenchmarkError(f"unbalanced function {signature}")
 
 
 def patch_main_source(source_text: str, mode: int, loops: int, detected_outer_runs: int = 1) -> tuple[str, str]:
@@ -998,12 +1047,12 @@ def patch_main_source(source_text: str, mode: int, loops: int, detected_outer_ru
                 return source_text[:start + dynamic.start()] + replacement + source_text[start + closing:], f"main.cpp lifecycle loop={outer}"
         matches = list(re.finditer(r'(?m)^[ \t]*' + statement, masked))
     if len(matches) != 1 or len(re.findall(r'\bGeneralTestOneImage\s*\(', masked)) != 1:
-        raise RuntimeError("unsupported main.cpp lifecycle loop; refusing ambiguous patch")
+        raise BenchmarkError("unsupported main.cpp lifecycle loop; refusing ambiguous patch")
     match = matches[0]
     # A call hidden in another loop/conditional must not silently multiply runs.
     prefix = masked[:match.start()]
     if prefix.count('{') != prefix.count('}') or re.search(r'(?:for|while)\s*\([^;{}]*(?:;[^{}]*)?\)\s*$', prefix):
-        raise RuntimeError("unsupported enclosing loop/conditional around GeneralTestOneImage")
+        raise BenchmarkError("unsupported enclosing loop/conditional around GeneralTestOneImage")
     outer = loops if mode == 1 else 1
     replacement = (
         '    ANC_Status status = ANC_SS_OK;\n'
@@ -1026,11 +1075,11 @@ def patch_process_source(source_text: str, mode: int, loops: int) -> tuple[str, 
     declarations = list(re.finditer(r'\bint\s+count\s*=\s*(?:optParam\.loop_cnt|\d+)\s*;', masked))
     process_loops = list(re.finditer(r'for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*(?:count|\d+)\s*;[^)]*\)', masked))
     if len(declarations) != 1 or len(process_loops) != 1:
-        raise RuntimeError("unsupported post_process_test.cpp process loop; refusing ambiguous patch")
+        raise BenchmarkError("unsupported post_process_test.cpp process loop; refusing ambiguous patch")
     declaration, loop = declarations[0], process_loops[0]
     assignments = list(re.finditer(r'(?m)^[ \t]*count\s*=\s*(?:optParam\.loop_cnt|\d+)\s*;[ \t]*', masked))
     if any(not declaration.end() <= m.start() < loop.start() for m in assignments):
-        raise RuntimeError("unexpected count assignment outside process-loop setup")
+        raise BenchmarkError("unexpected count assignment outside process-loop setup")
     inner = 1 if mode == 1 else loops
     # Replace each known override too, so a dirty hard-coded count cannot defeat -c.
     edits = [(declaration.start(), declaration.end(), f'int count = {inner};')]
@@ -1045,7 +1094,7 @@ def patch_process_source(source_text: str, mode: int, loops: int) -> tuple[str, 
 
 def source_patch(path: str, original: bytes, patched: bytes) -> str:
     if not original.endswith(b'\n') or not patched.endswith(b'\n'):
-        raise RuntimeError(f"source must end with a newline: {path}")
+        raise BenchmarkError(f"source must end with a newline: {path}")
     return ''.join(difflib.unified_diff(original.decode().splitlines(True), patched.decode().splitlines(True),
                                         fromfile='a/' + path, tofile='b/' + path))
 
@@ -1062,14 +1111,14 @@ def git_apply(repo_root: Path, patch: Path, reverse: bool = False) -> None:
 @contextmanager
 def temporary_source_patch(repo_root: Path, main_source: Path | None, mode: int, loops: int, work_dir: Path):
     if main_source is None:
-        raise RuntimeError("both loop modes require a discoverable native_test/src/main.cpp")
+        raise BenchmarkError("both loop modes require a discoverable native_test/src/main.cpp")
     sources = [main_source, main_source.with_name('post_process_test.cpp')]
     originals, patched, descriptions, patch_parts = {}, {}, [], []
     for source, transform in zip(sources, (patch_main_source, patch_process_source)):
         rel = str(source.relative_to(repo_root))
         git_bytes(repo_root, 'ls-files', '--error-unmatch', '--', rel)
         if source.is_symlink():
-            raise RuntimeError('refusing symlink source')
+            raise BenchmarkError('refusing symlink source')
         originals[rel] = source.read_bytes()
         try:
             text, description = transform(originals[rel].decode('utf-8'), mode, loops)
@@ -1162,23 +1211,23 @@ def validate_run(log_text: str, mode: int, loops: int) -> dict:
     outer = loops if mode == 1 else 1
     pids = {row[1] for row in begins + ends}
     if len(pids) != 1:
-        raise RuntimeError(f"expected one instrumented siq_test process, found {len(pids)}")
+        raise BenchmarkError(f"expected one instrumented siq_test process, found {len(pids)}")
     expected = [(str(mode), next(iter(pids)), str(i)) for i in range(1, outer + 1)]
     if begins != expected or [row[:3] for row in ends] != expected or any(row[3] != '0' for row in ends):
-        raise RuntimeError(f"incomplete or incorrect lifecycle loops: expected {outer}, begin={len(begins)}, end={len(ends)}")
+        raise BenchmarkError(f"incomplete or incorrect lifecycle loops: expected {outer}, begin={len(begins)}, end={len(ends)}")
     markers = list(LIFECYCLE_MARKER_RE.finditer(log_text))
     for index in range(outer):
         begin, end = markers[index * 2:index * 2 + 2]
         if begin.group('kind') != 'BEGIN' or end.group('kind') != 'END':
-            raise RuntimeError('lifecycle markers are not paired in execution order')
+            raise BenchmarkError('lifecycle markers are not paired in execution order')
         count = len(PERF_MARKER_RE.findall(log_text[begin.end():end.start()]))
         if count != (1 if mode == 1 else loops):
-            raise RuntimeError('timing markers are outside the verified lifecycle scope')
+            raise BenchmarkError('timing markers are outside the verified lifecycle scope')
     process_count = len(PERF_MARKER_RE.findall(log_text))
     if process_count != loops:
-        raise RuntimeError(f"process_images executed {process_count} times, expected exactly {loops}; artifacts rejected")
+        raise BenchmarkError(f"process_images executed {process_count} times, expected exactly {loops}; artifacts rejected")
     if any(marker in log_text for marker in ('Segmentation fault', 'native test error!', 'GeneralTestOneImage failed', 'PROCESS_IMAGES_FAILED')):
-        raise RuntimeError("native test failed; artifacts rejected")
+        raise BenchmarkError("native test failed; artifacts rejected")
     return {'pid': int(next(iter(pids))), 'lifecycle_count': outer, 'process_count': process_count}
 
 
@@ -1224,7 +1273,7 @@ def structured_performance(log_text: str, requested: str, iterations: int) -> di
                 for start, stop in process_windows)
             if len(events) != iterations or not scoped:
                 if len(markers) != iterations:
-                    raise RuntimeError('process_image timing coverage is incomplete')
+                    raise BenchmarkError('process_image timing coverage is incomplete')
                 if events:
                     warnings.append('incomplete leave coverage; using complete outer markers')
                 events, source = markers, 'native_outer_marker_ms'
@@ -1232,7 +1281,7 @@ def structured_performance(log_text: str, requested: str, iterations: int) -> di
                 selected_windows = [(start, stop + 1) for start, stop in process_windows] if process_windows else None
         values = [event[2] for event in events]
         if any(not math.isfinite(v) or v < 0 for v in values):
-            raise RuntimeError('invalid timing value')
+            raise BenchmarkError('invalid timing value')
         composition = ([[event[1] for event in events if start <= event[0] < stop]
                         for start, stop in selected_windows] if selected_windows is not None else None)
         counts = [len(names) for names in composition] if composition is not None else None
@@ -1289,7 +1338,7 @@ def memory_measurement(path: Path, native: str) -> tuple:
         reader = csv.DictReader(stream)
         fields = reader.fieldnames or []
         if 'time' not in fields or len(fields) != len(set(fields)):
-            raise RuntimeError('missing/duplicate memory CSV columns')
+            raise BenchmarkError('missing/duplicate memory CSV columns')
         rows = []
         for row in reader:
             try:
@@ -1300,24 +1349,24 @@ def memory_measurement(path: Path, native: str) -> tuple:
                     raise ValueError('non-finite/negative')
                 rows.append(values)
             except (TypeError, ValueError, KeyError) as exc:
-                raise RuntimeError('invalid memory CSV sample') from exc
+                raise BenchmarkError('invalid memory CSV sample') from exc
     stamps = [row['time'] for row in rows]
     intervals = [right - left for left, right in zip(stamps, stamps[1:])]
     if len(rows) < 2 or stamps[-1] <= stamps[0] or any(v < 0 for v in intervals):
-        raise RuntimeError('incomplete/non-monotonic memory CSV')
+        raise BenchmarkError('incomplete/non-monotonic memory CSV')
     if not any(name in fields for name in expected - {'time'}):
-        raise RuntimeError('CSV has no recognized memory measurements')
+        raise BenchmarkError('CSV has no recognized memory measurements')
     for current, peak, _ in MEMORY_COLUMNS.values():
         if peak in fields and any(r[peak] < l[peak] for l, r in zip(rows, rows[1:])):
-            raise RuntimeError('cumulative sampled peak decreased')
+            raise BenchmarkError('cumulative sampled peak decreased')
         if peak in fields and current in fields and any(r[current] > r[peak] + .0051 for r in rows):
-            raise RuntimeError('current usage exceeds producer cumulative peak')
+            raise BenchmarkError('current usage exceeds producer cumulative peak')
     clean = ANSI_ESCAPE_RE.sub('', native)
     def native_number(label, unit):
         marker = re.search(re.escape(label) + r'\s*:', clean)
         match = re.search(re.escape(label) + r'\s*:\s*(\d+(?:\.\d+)?)\s*' + unit, clean)
         if marker and not match:
-            raise RuntimeError('invalid native memory summary value')
+            raise BenchmarkError('invalid native memory summary value')
         return float(match.group(1)) if match else None
     checks, memory = {}, {}
     for component, (current, peak, label) in MEMORY_COLUMNS.items():
@@ -1326,7 +1375,7 @@ def memory_measurement(path: Path, native: str) -> tuple:
         native_value = native_number(label, 'MB')
         if value is not None and native_value is not None:
             if abs(value - native_value) > 0.0051:
-                raise RuntimeError('native memory summary disagrees with CSV: ' + component)
+                raise BenchmarkError('native memory summary disagrees with CSV: ' + component)
             checks[component] = 'verified_with_display_rounding'
         else:
             checks[component] = 'unverified_missing_source'
@@ -1341,13 +1390,13 @@ def memory_measurement(path: Path, native: str) -> tuple:
     highwater = max(r[column] for r in rows) if column in fields else None
     native_highwater = native_number('RSS Max (getrusage)', 'MB')
     if highwater is not None and native_highwater is not None and abs(highwater - native_highwater) > .0051:
-        raise RuntimeError('native RSS getrusage disagrees with CSV')
+        raise BenchmarkError('native RSS getrusage disagrees with CSV')
     memory['rss']['getrusage_high_water'] = memory_value(highwater, 'csv:' + column if highwater is not None else None)
     memory['rss']['native_getrusage_high_water'] = memory_value(native_highwater, 'native_summary:RSS Max (getrusage)')
     memory['cross_validation'] = checks
     period = native_number('Sampling Period', 'ms')
     if period is not None and period <= 0:
-        raise RuntimeError('configured sampling period must be positive')
+        raise BenchmarkError('configured sampling period must be positive')
     duplicates = intervals.count(0)
     sampling = {
         'configured_period_ms': period, 'sample_count': len(rows), 'rows': len(rows),
@@ -1729,14 +1778,14 @@ def discover_trace(
         if trace.is_file() and is_fresh(trace):
             if trace.stat().st_size > 0:
                 return trace
-            raise RuntimeError(f"Perfetto trace is empty: {trace}")
-        raise RuntimeError(f"requested Perfetto trace was not newly produced: {trace}")
+            raise BenchmarkError(f"Perfetto trace is empty: {trace}")
+        raise BenchmarkError(f"requested Perfetto trace was not newly produced: {trace}")
     expected = output_dir / f"perfetto_{adapter}.perfetto"
     if expected.is_file():
         if not is_fresh(expected):
-            raise RuntimeError(f"expected Perfetto trace was not newly produced: {expected}")
+            raise BenchmarkError(f"expected Perfetto trace was not newly produced: {expected}")
         if expected.stat().st_size == 0:
-            raise RuntimeError(f"Perfetto trace is empty: {expected}")
+            raise BenchmarkError(f"Perfetto trace is empty: {expected}")
         return expected
     candidates = sorted(
         (path for path in output_dir.glob("*.perfetto") if is_fresh(path)),
@@ -1748,7 +1797,7 @@ def discover_trace(
         return adapter_candidates[0]
     if len(candidates) == 1:
         return candidates[0]
-    raise RuntimeError(f"cannot uniquely discover Perfetto trace in {output_dir}")
+    raise BenchmarkError(f"cannot uniquely discover Perfetto trace in {output_dir}")
 
 
 def run_single(args, result) -> int:
@@ -1994,7 +2043,7 @@ def run_single(args, result) -> int:
                 "prepare device",
             )
             if cleanup_exit != 0:
-                raise RuntimeError(f"adb-sync output cleanup failed; see {cleanup_log}")
+                raise BenchmarkError(f"adb-sync output cleanup failed; see {cleanup_log}")
         run_exit = run_logged(
             run_command,
             repo_root,
@@ -2023,24 +2072,27 @@ def run_single(args, result) -> int:
     failed_stage = next((event for event in reversed(events)
                          if event.get('state') == 'end' and event.get('exit_code')), None)
     if run_exit and failed_stage:
-        raise BenchmarkError(f"{failed_stage['stage']} failed (exit={failed_stage['exit_code']}); full run.log shown above: {run_log}")
+        raise BenchmarkError(
+            f"{failed_stage['stage']} failed (exit={failed_stage['exit_code']}); "
+            f"concise diagnostics shown above; full run log retained at {run_log}"
+        )
     build_log_line = extract_build_log_line(log_text)
     if build_log_line:
         append_debug(debug_log, f"[build] {build_log_line}")
     else:
         append_debug(debug_log, "[build] no representative build command found in run.log")
+    try:
+        validation = validate_run(log_text, args.mode, args.loops)
+    except BenchmarkError as exc:
+        raise BenchmarkError(f"{exc}; run script exit={run_exit}; see {run_log}") from exc
     performance = structured_performance(log_text, args.functions, args.loops)
     performance_samples = {name: metric['samples'] for name, metric in performance.items()}
     result['performance'] = performance
-    try:
-        validation = validate_run(log_text, args.mode, args.loops)
-    except RuntimeError as exc:
-        raise BenchmarkError(f"{exc}; run script exit={run_exit}; see {run_log}") from exc
     deployment = json.loads((work_dir / "deployment.json").read_text())
     if (deployment.get('input_manifest') != manifest_before or
             deployment.get('remote_input_manifest') != manifest_before or
             build_input_manifest(input_dir) != manifest_before):
-        raise RuntimeError('input changed or deployment lacks independent input verification')
+        raise BenchmarkError('input changed or deployment lacks independent input verification')
     result['experiment'].update({'input_frames': deployment['input_frames'],
                                  'actual_repeat': validation['process_count'],
                                  'processes': 1, 'lifecycle_calls': validation['lifecycle_count']})
@@ -2058,7 +2110,7 @@ def run_single(args, result) -> int:
     memory_summary = extract_memory_summary(log_text)
     csv_remotes = find_csv_paths(log_text)
     if len(csv_remotes) != 1 or not csv_remotes[0].endswith(f"_{validation['pid']}.csv"):
-        raise RuntimeError("memory CSV does not uniquely match this siq_test PID")
+        raise BenchmarkError("memory CSV does not uniquely match this siq_test PID")
     csv_dir = work_dir / "csv"
     csv_dir.mkdir()
     csv_locals: list[Path] = []
@@ -2095,7 +2147,7 @@ def run_single(args, result) -> int:
                 "pull memory CSV (relocated by the run script)",
             )
             if pull_exit != 0 or not csv_local.is_file():
-                raise RuntimeError(
+                raise BenchmarkError(
                     f"adb pull failed for {csv_remote} and for {moved_remote}; see {pull_log}"
                 )
         memory, sampling = memory_measurement(csv_local, memory_summary)
@@ -2150,7 +2202,7 @@ def run_single(args, result) -> int:
     try:
         trace_path = discover_trace(output_dir, args.adapter, args.trace, trace_before)
         if trace_path.stat().st_size == 0:
-            raise RuntimeError(f"Perfetto trace is empty: {trace_path}")
+            raise BenchmarkError(f"Perfetto trace is empty: {trace_path}")
         captured_trace = work_dir / trace_path.name
         shutil.copy2(trace_path, captured_trace)
         captured_trace.chmod(0o600)
@@ -2298,7 +2350,24 @@ def safe_error(exc):
         return {'type': 'Interrupted', 'message': 'interrupted; inspect recovery receipt'}
     if isinstance(exc, subprocess.TimeoutExpired):
         return {'type': 'Timeout', 'message': 'command timed out; private artifacts retained'}
-    return {'type': type(exc).__name__, 'message': 'operation failed; private artifacts retained (no raw exception output)'}
+    return {
+        'type': type(exc).__name__,
+        'message': 'unexpected operation failure; private exception report retained when artifacts are available',
+    }
+
+
+def retain_exception_report(work_dir: Path, exc: BaseException) -> Path:
+    """Persist an unexpected traceback privately without exposing it on stderr."""
+    path = work_dir / 'exception.log'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, 'w', encoding='utf-8', errors='replace') as report:
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=report)
+        report.flush()
+        os.fsync(report.fileno())
+    return path
 
 
 def utc_now():
@@ -2479,6 +2548,13 @@ def execute_single(args):
         result['exit_code'] = run_single(args, result)
     except BaseException as exc:
         result['primary_error'] = safe_error(exc)
+        if not isinstance(exc, (BenchmarkError, SystemExit, KeyboardInterrupt, subprocess.TimeoutExpired)) \
+                and result.get('_work_dir'):
+            try:
+                report = retain_exception_report(Path(result['_work_dir']), exc)
+                result['artifacts']['exception_report'] = artifact_info(report)
+            except OSError:
+                pass
         result['exit_code'] = (130 if isinstance(exc, KeyboardInterrupt) else
                                124 if isinstance(exc, subprocess.TimeoutExpired) or result.get('run_exit') == 124 else 1)
         result['status'] = 'interrupted' if isinstance(exc, KeyboardInterrupt) else 'failed'
@@ -3186,6 +3262,9 @@ def main(argv=None) -> int:
         print(json.dumps(public_result(result), ensure_ascii=False, allow_nan=False))
     if result.get('primary_error'):
         print('[error] ' + result['primary_error']['message'], file=sys.stderr)
+        exception_report = result.get('artifacts', {}).get('exception_report', {}).get('path')
+        if exception_report:
+            print('[error details] private traceback: ' + exception_report, file=sys.stderr)
     if result.get('recovery_error'):
         print('[recovery error] ' + result['recovery_error']['message'], file=sys.stderr)
     return result['exit_code']
