@@ -245,8 +245,7 @@ class RecoveryGate:
                 or now - self.changed < self.quiet
                 or now - self.last_attempt < self.cooldown):
             return None
-        reason = terminal_failure(screen)
-        return None if reason == 'quota exhausted' else reason
+        return terminal_failure(screen)
 
     def reserve(self, now):
         self.last_attempt = now
@@ -397,7 +396,7 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
     cli = choose_cli(cli)
     command = launch_command(cli, arguments)
     print('step-watch: mode=owned-pty UID=%d quiet=%gs cooldown=%gs; '
-          'retry=429,overload deny=402-key-or-pool-quota-exhausted balance-check=disabled' %
+          'continue=429,402-quota,overload balance-check=disabled' %
           (uid, quiet, cooldown), flush=True)
     saved = termios.tcgetattr(0)
     handlers = {}
@@ -439,7 +438,6 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
         gate.blocked = False
         tty.setraw(0)
         status = None
-        reported_reason = None
         while True:
             info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
             if info is not None:
@@ -485,11 +483,6 @@ def run(cli=None, arguments=(), quiet=QUIET_WINDOW, cooldown=COOLDOWN):
             if status is not None:
                 continue
             visible = screen.logical_display()
-            failure = terminal_failure(visible)
-            if failure != reported_reason:
-                if failure == 'quota exhausted':
-                    write_all(2, b'\r\nstep-watch: recovery=quota-exhausted; automatic continue disabled\r\n')
-                reported_reason = failure
             reason = gate.ready(visible, time.monotonic())
             if reason:
                 # Cursor must be in the blank composer, not approval/tool UI.
