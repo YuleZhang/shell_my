@@ -40,7 +40,8 @@ export class RecoveryGate {
     const last = [...(event.messages || [])].reverse().find(m => m.role === 'assistant');
     if (!last || last.stopReason !== 'error' || typeof last.errorMessage !== 'string') return;
     // Only the last native error, never transcript/terminal/history matching.
-    // Explicit Key or budget-pool exhaustion wins over transient text.
+    // Quota exhaustion is recoverable by a new user turn so routing can select
+    // newly available quota; this does not retry the failed provider request.
     if (/OpenAI\s+API\s+error\s*\(402\)/i.test(last.errorMessage) &&
         (/API\s+Key\s+quota\s+has\s+been\s+exhausted\b/i.test(last.errorMessage) ||
          /\b(?:api_key_quota_exhausted|quota_unavailable|insufficient_quota)\b/i.test(last.errorMessage) ||
@@ -61,7 +62,6 @@ export class RecoveryGate {
     const denied = recovery => ({ recovery, eligible: false });
     // Native getEditorText() cannot prove absence of image-only drafts, host
     // overlays, custom editor state or pending terminal input. No opt-in bypass.
-    if (this.candidate === 'quota-exhausted') return denied('quota-exhausted');
     if (!safety || safety.verified !== true) return denied('ui-safety-unavailable');
     if (!this.candidate) return denied('no-candidate');
     if (!this.settled) return denied('not-settled');
@@ -120,7 +120,7 @@ function privateRoot(uid) {
 
 // This ELF's bundled implementation was inspected and exercised by the isolated
 // TUI smoke. Unknown native builds/layouts fail closed, not by user opt-in flags.
-const NATIVE_SHA256 = 'da9218ed201419a93cd233adb203743657fe497fee15117e768d2c9438dd3ae5';
+const NATIVE_SHA256 = '98aa2665e1c97847cbfc874ab641ab90978fc1e835a4ad64d7553827bcaaa769';
 export class NativeUISafety {
   constructor(ctx) {
     this.ctx = ctx;

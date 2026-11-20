@@ -65,13 +65,17 @@ for (const message of poolErrors) {
     const poolGate = new RecoveryGate(() => time);
     poolGate.end(fail(message + suffix)); poolGate.settle(); time += 60001;
     assert.equal(poolGate.candidate, 'quota-exhausted');
-    for (const safety of [null, safe]) {
-      assert.deepEqual(poolGate.status(ctx, safety), { recovery: 'quota-exhausted', eligible: false });
-      poolGate.recover({ sendUserMessage: () => assert.fail('budget pool quota must never send') }, ctx, safety);
-    }
+    assert.deepEqual(poolGate.status(ctx), { recovery: 'ui-safety-unavailable', eligible: false });
+    let poolSends = 0;
+    poolGate.recover({ sendUserMessage: () => { poolSends++; } }, ctx);
+    assert.equal(poolSends, 0);
+    assert.equal(poolGate.status(ctx, safe).eligible, true);
+    assert.equal(poolGate.recover({ sendUserMessage: () => { poolSends++; } }, ctx, safe).recovery,
+                 'submitted-unconfirmed');
+    assert.equal(poolSends, 1);
     // Only the final assistant error matters; a new transient run may recover.
     poolGate.end({ messages: [...fail(message).messages, ...fail(rateError).messages] });
-    poolGate.settle(); time += 3001;
+    poolGate.settle(); time += 60001;
     assert.equal(poolGate.candidate, 'rate-limit');
     assert.equal(poolGate.status(ctx, safe).eligible, true);
   }
@@ -129,9 +133,11 @@ gate.recover({ sendUserMessage: (...args) => sends.push(args) }, ctx, safe);
 assert.equal(sends.length, 3);
 for (const message of [quotaError, quotaError + '\nrate_limit_exceeded\n' + failure.messages[0].errorMessage]) {
   gate.end(fail(message)); gate.settle(); time += 60001;
-  assert.equal(gate.status(ctx, safe).recovery, 'quota-exhausted');
-  gate.recover({ sendUserMessage: () => assert.fail('quota must never send') }, ctx, safe);
+  assert.equal(gate.candidate, 'quota-exhausted');
+  assert.equal(gate.status(ctx, safe).eligible, true);
+  gate.recover({ sendUserMessage: (...args) => sends.push(args) }, ctx, safe);
 }
+assert.equal(sends.length, 5);
 for (const message of ['API Key quota has been exhausted', 'quota_unavailable', 'insufficient_quota',
                        poolError.replace('(402)', '(500)'), poolError.replace('(402)', '(401)'),
                        'OpenAI API error (402): unrelated',
@@ -183,7 +189,7 @@ try {
   assert.equal((await request(meta, { op: 'recover' })).data.eligible, false);
   handlers.get('agent_end')(fail(poolError), ctx); handlers.get('agent_settled')({}, ctx);
   for (const op of ['status', 'recover']) {
-    assert.deepEqual((await request(meta, { op })).data, { recovery: 'quota-exhausted', eligible: false });
+    assert.deepEqual((await request(meta, { op })).data, { recovery: 'ui-safety-unavailable', eligible: false });
   }
   const nonce = Date.now().toString(16).padStart(12, '0') + 'a'.repeat(20);
   assert.equal((await request(meta, {}, nonce)).code, 200);
