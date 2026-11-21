@@ -509,7 +509,7 @@ class IPC(unittest.TestCase):
         self.assertEqual(scans, [False, True, True, True, True])
         log = (self.root / 'daemon.log').read_text()
         self.assertEqual(stat.S_IMODE((self.root / 'daemon.log').stat().st_mode), 0o600)
-        self.assertIn('policy: continue=overload,rate-limit,quota-exhausted quiet=3s cooldown=60s', log)
+        self.assertIn('policy: retry=overload,rate-limit quota-exhausted=blocked quiet=3s cooldown=60s', log)
         self.assertIn('initial scan complete connected=1 unbridged=1', log)
         self.assertEqual(log.count('PID=101 state=connected recovery=quota-exhausted'), 1)
         self.assertIn('PID=102 state=needs-extension-load recovery=unavailable', log)

@@ -28,7 +28,7 @@ SESSION_STATES = frozenset({
     'connected', 'needs-extension-load', 'waiting-child', 'unsupported-backend',
 })
 ROW_REASONS = RECOVERY_REASONS | {'via-native-child'}
-RETRY_POLICY = ('policy: continue=overload,rate-limit,quota-exhausted '
+RETRY_POLICY = ('policy: retry=overload,rate-limit quota-exhausted=blocked '
                 'quiet=3s cooldown=60s; settled/UI-safe only; '
                 'unconfirmed submissions are not retried')
 
