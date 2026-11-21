@@ -40,8 +40,8 @@ export class RecoveryGate {
     const last = [...(event.messages || [])].reverse().find(m => m.role === 'assistant');
     if (!last || last.stopReason !== 'error' || typeof last.errorMessage !== 'string') return;
     // Only the last native error, never transcript/terminal/history matching.
-    // Quota exhaustion is recoverable by a new user turn so routing can select
-    // newly available quota; this does not retry the failed provider request.
+    // Explicit quota exhaustion wins over any transient text in the same error
+    // and is always terminal for automatic recovery.
     if (/OpenAI\s+API\s+error\s*\(402\)/i.test(last.errorMessage) &&
         (/API\s+Key\s+quota\s+has\s+been\s+exhausted\b/i.test(last.errorMessage) ||
          /\b(?:api_key_quota_exhausted|quota_unavailable|insufficient_quota)\b/i.test(last.errorMessage) ||
@@ -62,6 +62,7 @@ export class RecoveryGate {
     const denied = recovery => ({ recovery, eligible: false });
     // Native getEditorText() cannot prove absence of image-only drafts, host
     // overlays, custom editor state or pending terminal input. No opt-in bypass.
+    if (this.candidate === 'quota-exhausted') return denied('quota-exhausted');
     if (!safety || safety.verified !== true) return denied('ui-safety-unavailable');
     if (!this.candidate) return denied('no-candidate');
     if (!this.settled) return denied('not-settled');

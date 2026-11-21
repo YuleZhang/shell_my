@@ -121,7 +121,7 @@ sys.exit(7)
 
 
 class SafetyTests(unittest.TestCase):
-    def test_budget_pool_quota_recovers_with_continue(self):
+    def test_budget_pool_quota_denied_and_new_run_can_recover(self):
         errors = [POOL_QUOTA, POOL_QUOTA.replace('Error: ', 'Error: Retry failed after 3 attempts: '),
                   'Error: OpenAI API error (402): {"code":"quota_unavailable"}',
                   'Error: OpenAI API error (402): {"type":"insufficient_quota"}',
@@ -135,7 +135,7 @@ class SafetyTests(unittest.TestCase):
                     self.assertEqual(w.terminal_failure(screen), 'quota exhausted')
                     gate = w.RecoveryGate(.3, 0)
                     gate.output(screen, 10)
-                    self.assertEqual(gate.ready(screen, 100), 'quota exhausted')
+                    self.assertIsNone(gate.ready(screen, 100))
                     self.assertEqual(w.terminal_failure(screen + '\n› continue\n' + RATE + FOOTER), 'rate limit')
             self.assertIsNone(w.terminal_failure(error.replace('(402)', '(500)') + FOOTER))
         for error in ('quota_unavailable', 'Error: OpenAI API error (402): {"message":"unrelated"}'):
@@ -465,17 +465,20 @@ class PtyTests(unittest.TestCase):
                 self.assertFalse(any(line.startswith('usage:') for line in report))
 
     def test_real_80_column_pty_rate_and_quota(self):
-        for error in (RATE, MULTILINE_RATE, QUOTA, MULTILINE_QUOTA, POOL_QUOTA):
+        for error, expected in ((RATE, b'continue\r'), (MULTILINE_RATE, b'continue\r'),
+                                (QUOTA, b''), (MULTILINE_QUOTA, b''), (POOL_QUOTA, b'')):
             with self.subTest(error=error):
                 (self.root / 'report').unlink(missing_ok=True)
                 Path(self.env['REPORT'] + '.reserve').unlink(missing_ok=True)
                 self.env.update(ERROR=error, FOOTER=FOOTER.rsplit('\n', 1)[0])
                 self.assertEqual(self.finish(self.spawn(columns=80)), 7)
-                self.assertEqual(self.report()[-1], 'input:' + b'continue\r'.hex())
+                self.assertEqual(self.report()[-1], 'input:' + expected.hex())
                 row = 1 + sum(max(1, (len(line) + 79) // 80)
                               for line in (error + self.env['FOOTER']).split('\n'))
                 self.assertIn('cursor:%d,3' % row, self.report())
-                self.assertTrue(Path(self.env['REPORT'] + '.reserve').exists())
+                self.assertEqual(Path(self.env['REPORT'] + '.reserve').exists(), bool(expected))
+                if not expected:
+                    self.assertIn(b'recovery=quota-exhausted', self.output)
                 self.assertFalse(any(line.startswith('usage:') for line in self.report()))
 
     def test_real_80_column_pty_tail_and_cursor_stay_safe(self):
@@ -510,13 +513,13 @@ class PtyTests(unittest.TestCase):
                 self.assertIn(b'mode=owned-pty', self.output)
                 self.assertIn(b'recovery=submitted-unconfirmed', self.output)
 
-    def test_real_pty_quota_sends_continue_without_provider_retry(self):
+    def test_real_pty_quota_never_sends_and_reports_reason(self):
         self.env['ERROR'] = ('Error: OpenAI API error (402): {"message":"API Key quota has been exhausted.",'
-                             '"code":api_key_quota_exhausted}')
+                             '"code":api_key_quota_exhausted"}')
         self.assertEqual(self.finish(self.spawn()), 7)
-        self.assertEqual(self.report()[-1], 'input:' + b'continue\r'.hex())
-        self.assertIn(b'recovery=submitted-unconfirmed reason=quota exhausted', self.output)
-        self.assertTrue(Path(self.env['REPORT'] + '.reserve').exists())
+        self.assertEqual(self.report()[-1], 'input:')
+        self.assertIn(b'recovery=quota-exhausted', self.output)
+        self.assertFalse(Path(self.env['REPORT'] + '.reserve').exists())
 
     def test_real_pty_draft_refresh_and_paste(self):
         for mode, data in [('draft', b'my draft'), ('overload', b'\x1b[200~paste\x1b[201~'), ('refresh', None)]:
