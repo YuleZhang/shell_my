@@ -1080,6 +1080,33 @@ def patch_main_source(source_text: str, mode: int, loops: int, detected_outer_ru
     pattern = re.compile(r'(?m)^[ \t]*(?:ANC_Status\s+status(?:\s*=\s*ANC_SS_OK)?;\s*)?' + loop)
     matches = list(pattern.finditer(masked))
     if not matches:
+        lifecycle = re.search(
+            r'(?m)^[ \t]*for\s*\(\s*int\s+(?P<var>\w+)\s*=\s*0\s*;\s*'
+            r'(?P=var)\s*<\s*(?P<limit>\d+)\s*;[^)]*\)\s*\{', masked)
+        if lifecycle and len(re.findall(r'\bGeneralTestOneImage\s*\(', masked)) == 1:
+            opening = lifecycle.end() - 1
+            depth = 1
+            closing = opening + 1
+            while depth and closing < len(masked):
+                depth += (masked[closing] == '{') - (masked[closing] == '}')
+                closing += 1
+            call_match = re.search(r'ANC_Status\s+status\s*=\s*test\.GeneralTestOneImage\(optParam\);',
+                                   masked[opening + 1:closing - 1])
+            if (depth == 0 and call_match
+                    and re.fullmatch(r'\s*PostProcessTest\s+test\s*;\s*',
+                                     masked[opening + 1:opening + 1 + call_match.start()])
+                    and masked[:lifecycle.start()].count('{') == masked[:lifecycle.start()].count('}')):
+                call_start = opening + 1 + call_match.start()
+                call_end = opening + 1 + call_match.end()
+                outer = loops if mode == 1 else 1
+                iteration = lifecycle.group('var') + ' + 1'
+                replacement = (body[lifecycle.start():lifecycle.start('limit')] + str(outer)
+                               + body[lifecycle.end('limit'):call_start]
+                               + f'printf("@@SIQ_BENCH_BEGIN@@ mode={mode} pid=%d iteration=%d\\n", (int)getpid(), {iteration});\n        '
+                               + body[call_start:call_end]
+                               + f'\n        printf("@@SIQ_BENCH_END@@ mode={mode} pid=%d iteration=%d status=%d\\n", (int)getpid(), {iteration}, (int)status);'
+                               + body[call_end:closing])
+                return source_text[:start + lifecycle.start()] + replacement + source_text[start + closing:], f"main.cpp lifecycle loop={outer}"
         dynamic = re.search(r'(?m)^[ \t]*for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*optParam\.loop_cnt\s*;[^)]*\)\s*\{', masked)
         if dynamic and len(re.findall(r'\bGeneralTestOneImage\s*\(', masked)) == 1:
             opening = dynamic.end() - 1
