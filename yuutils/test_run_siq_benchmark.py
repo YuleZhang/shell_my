@@ -159,6 +159,25 @@ class MeasurementTest(unittest.TestCase):
                 self.assertIn('return -1;', patched)
                 self.assertNotIn('i < optParam.loop_cnt', patched)
 
+    def test_lifecycle_loop_preserves_object_and_failure_checks(self):
+        main = ('int main() {\n'
+                '    for (int i = 0; i < 1; i++) {\n'
+                '        PostProcessTest test;\n'
+                '        ANC_Status status = test.GeneralTestOneImage(optParam);\n'
+                '        if (test.algo_load_contract_failed()) { return -1; }\n'
+                '        if (status != ANC_SS_OK) { return -1; }\n'
+                '    }\n'
+                '    return 0;\n}\n')
+        for mode, outer in ((1, 3), (2, 1)):
+            with self.subTest(mode=mode):
+                patched, _ = b.patch_main_source(main, mode, 3)
+                self.assertIn(f'i < {outer}', patched)
+                self.assertEqual(patched.count('@@SIQ_BENCH_BEGIN@@'), 1)
+                self.assertEqual(patched.count('@@SIQ_BENCH_END@@'), 1)
+                self.assertIn('PostProcessTest test;', patched)
+                self.assertIn('if (test.algo_load_contract_failed()) { return -1; }', patched)
+                self.assertIn('if (status != ANC_SS_OK) { return -1; }', patched)
+
     def test_duplicate_adb_serial_requires_transport_and_pins_commands(self):
         devices = ('List of devices attached\n'
                    'same device product:first model:first transport_id:1\n'
